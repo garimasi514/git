@@ -434,7 +434,6 @@ test_expect_success 'double quoted plink.exe in GIT_SSH_COMMAND' '
 	expect_ssh "-v -P 123" myhost src
 '
 
-SQ="'"
 test_expect_success 'single quoted plink.exe in GIT_SSH_COMMAND' '
 	copy_ssh_wrapper_as "$TRASH_DIRECTORY/plink.exe" &&
 	GIT_SSH_COMMAND="$SQ$TRASH_DIRECTORY/plink.exe$SQ -v" \
@@ -630,9 +629,8 @@ test_expect_success CASE_INSENSITIVE_FS 'colliding file detection' '
 	test_i18ngrep "the following paths have collided" icasefs/warning
 '
 
-partial_clone () {
+partial_clone_server () {
 	       SERVER="$1" &&
-	       URL="$2" &&
 
 	rm -rf "$SERVER" client &&
 	test_create_repo "$SERVER" &&
@@ -642,14 +640,21 @@ partial_clone () {
 	test_commit -C "$SERVER" two &&
 	HASH2=$(git hash-object "$SERVER/two.t") &&
 	test_config -C "$SERVER" uploadpack.allowfilter 1 &&
-	test_config -C "$SERVER" uploadpack.allowanysha1inwant 1 &&
+	test_config -C "$SERVER" uploadpack.allowanysha1inwant 1
+}
 
+partial_clone () {
+	       SERVER="$1" &&
+	       URL="$2" &&
+
+	partial_clone_server "${SERVER}" &&
 	git clone --filter=blob:limit=0 "$URL" client &&
 
 	git -C client fsck &&
 
 	# Ensure that unneeded blobs are not inadvertently fetched.
-	test_config -C client extensions.partialclone "not a remote" &&
+	test_config -C client remote.origin.promisor "false" &&
+	git -C client config --unset remote.origin.partialclonefilter &&
 	test_must_fail git -C client cat-file -e "$HASH1" &&
 
 	# But this blob was fetched, because clone performs an initial checkout
@@ -658,6 +663,11 @@ partial_clone () {
 
 test_expect_success 'partial clone' '
 	partial_clone server "file://$(pwd)/server"
+'
+
+test_expect_success 'partial clone with -o' '
+	partial_clone_server server &&
+	git clone -o blah --filter=blob:limit=0 "file://$(pwd)/server" client
 '
 
 test_expect_success 'partial clone: warn if server does not support object filtering' '
@@ -728,5 +738,8 @@ start_httpd
 test_expect_success 'partial clone using HTTP' '
 	partial_clone "$HTTPD_DOCUMENT_ROOT_PATH/server" "$HTTPD_URL/smart/server"
 '
+
+# DO NOT add non-httpd-specific tests here, because the last part of this
+# test script is only executed when httpd is available and enabled.
 
 test_done

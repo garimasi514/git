@@ -173,6 +173,50 @@ static struct patch_mode patch_mode_checkout_nothead = {
 			"the file\n"),
 };
 
+static struct patch_mode patch_mode_worktree_head = {
+	.diff = { "diff-index", NULL },
+	.apply = { "-R", NULL },
+	.apply_check = { "-R", NULL },
+	.is_reverse = 1,
+	.prompt_mode = {
+		N_("Discard mode change from index and worktree [y,n,q,a,d%s,?]? "),
+		N_("Discard deletion from index and worktree [y,n,q,a,d%s,?]? "),
+		N_("Discard this hunk from index and worktree [y,n,q,a,d%s,?]? "),
+	},
+	.edit_hunk_hint = N_("If the patch applies cleanly, the edited hunk "
+			     "will immediately be marked for discarding."),
+	.help_patch_text =
+		N_("y - discard this hunk from worktree\n"
+		   "n - do not discard this hunk from worktree\n"
+		   "q - quit; do not discard this hunk or any of the remaining "
+			"ones\n"
+		   "a - discard this hunk and all later hunks in the file\n"
+		   "d - do not discard this hunk or any of the later hunks in "
+			"the file\n"),
+};
+
+static struct patch_mode patch_mode_worktree_nothead = {
+	.diff = { "diff-index", "-R", NULL },
+	.apply = { NULL },
+	.apply_check = { NULL },
+	.is_reverse = 0,
+	.prompt_mode = {
+		N_("Apply mode change to index and worktree [y,n,q,a,d%s,?]? "),
+		N_("Apply deletion to index and worktree [y,n,q,a,d%s,?]? "),
+		N_("Apply this hunk to index and worktree [y,n,q,a,d%s,?]? "),
+	},
+	.edit_hunk_hint = N_("If the patch applies cleanly, the edited hunk "
+			     "will immediately be marked for applying."),
+	.help_patch_text =
+		N_("y - apply this hunk to worktree\n"
+		   "n - do not apply this hunk to worktree\n"
+		   "q - quit; do not apply this hunk or any of the remaining "
+			"ones\n"
+		   "a - apply this hunk and all later hunks in the file\n"
+		   "d - do not apply this hunk or any of the later hunks in "
+			"the file\n"),
+};
+
 struct hunk_header {
 	unsigned long old_offset, old_count, new_offset, new_count;
 	/*
@@ -538,6 +582,8 @@ static void render_hunk(struct add_p_state *s, struct hunk *hunk,
 		 */
 		const char *p;
 		size_t len;
+		unsigned long old_offset = header->old_offset;
+		unsigned long new_offset = header->new_offset;
 
 		if (!colored) {
 			p = s->plain.buf + header->extra_start;
@@ -549,10 +595,14 @@ static void render_hunk(struct add_p_state *s, struct hunk *hunk,
 				- header->colored_extra_start;
 		}
 
+		if (s->mode->is_reverse)
+			old_offset -= delta;
+		else
+			new_offset += delta;
+
 		strbuf_addf(out, "@@ -%lu,%lu +%lu,%lu @@",
-			    header->old_offset, header->old_count,
-			    (unsigned long)(header->new_offset + delta),
-			    header->new_count);
+			    old_offset, header->old_count,
+			    new_offset, header->new_count);
 		if (len)
 			strbuf_add(out, p, len);
 		else if (colored)
@@ -1301,6 +1351,10 @@ static int patch_update_file(struct add_p_state *s,
 			prompt_mode_type = PROMPT_HUNK;
 
 		color_fprintf(stdout, s->s.prompt_color,
+			      "(%"PRIuMAX"/%"PRIuMAX") ",
+			      (uintmax_t)hunk_index + 1,
+			      (uintmax_t)file_diff->hunk_nr);
+		color_fprintf(stdout, s->s.prompt_color,
 			      _(s->mode->prompt_mode[prompt_mode_type]),
 			      s->buf.buf);
 		fflush(stdout);
@@ -1491,6 +1545,7 @@ soft_increment:
 		strbuf_reset(&s->buf);
 		reassemble_patch(s, file_diff, 0, &s->buf);
 
+		discard_index(s->s.r->index);
 		if (s->mode->apply_for_checkout)
 			apply_for_checkout(s, &s->buf,
 					   s->mode->is_reverse);
@@ -1501,7 +1556,9 @@ soft_increment:
 					 NULL, 0, NULL, 0))
 				error(_("'git apply' failed"));
 		}
-		repo_refresh_and_write_index(s->s.r, REFRESH_QUIET, 0);
+		if (!repo_read_index(s->s.r))
+			repo_refresh_and_write_index(s->s.r, REFRESH_QUIET, 0,
+						     1, NULL, NULL, NULL);
 	}
 
 	putchar('\n');
@@ -1516,8 +1573,7 @@ int run_add_p(struct repository *r, enum add_p_mode mode,
 	};
 	size_t i, binary_count = 0;
 
-	if (init_add_i_state(r, &s.s))
-		return error("Could not read `add -i` config");
+	init_add_i_state(&s.s, r);
 
 	if (mode == ADD_P_STASH)
 		s.mode = &patch_mode_stash;
@@ -1533,14 +1589,24 @@ int run_add_p(struct repository *r, enum add_p_mode mode,
 			s.mode = &patch_mode_checkout_head;
 		else
 			s.mode = &patch_mode_checkout_nothead;
+	} else if (mode == ADD_P_WORKTREE) {
+		if (!revision)
+			s.mode = &patch_mode_checkout_index;
+		else if (!strcmp(revision, "HEAD"))
+			s.mode = &patch_mode_worktree_head;
+		else
+			s.mode = &patch_mode_worktree_nothead;
 	} else
 		s.mode = &patch_mode_stage;
 	s.revision = revision;
 
-	if (repo_refresh_and_write_index(r, REFRESH_QUIET, 0) < 0 ||
+	if (discard_index(r->index) < 0 || repo_read_index(r) < 0 ||
+	    repo_refresh_and_write_index(r, REFRESH_QUIET, 0, 1,
+					 NULL, NULL, NULL) < 0 ||
 	    parse_diff(&s, ps) < 0) {
 		strbuf_release(&s.plain);
 		strbuf_release(&s.colored);
+		clear_add_i_state(&s.s);
 		return -1;
 	}
 
@@ -1559,5 +1625,6 @@ int run_add_p(struct repository *r, enum add_p_mode mode,
 	strbuf_release(&s.buf);
 	strbuf_release(&s.plain);
 	strbuf_release(&s.colored);
+	clear_add_i_state(&s.s);
 	return 0;
 }

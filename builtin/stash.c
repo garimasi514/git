@@ -396,7 +396,7 @@ static int do_apply_stash(const char *prefix, struct stash_info *info,
 	const struct object_id *bases[1];
 
 	read_cache_preload(NULL);
-	if (refresh_cache(REFRESH_QUIET))
+	if (refresh_and_write_cache(REFRESH_QUIET, 0, 0))
 		return -1;
 
 	if (write_cache_as_tree(&c_tree, 0, NULL))
@@ -427,6 +427,8 @@ static int do_apply_stash(const char *prefix, struct stash_info *info,
 				return error(_("could not save index tree"));
 
 			reset_head();
+			discard_cache();
+			read_cache();
 		}
 	}
 
@@ -485,7 +487,7 @@ static int do_apply_stash(const char *prefix, struct stash_info *info,
 	}
 
 	if (quiet) {
-		if (refresh_cache(REFRESH_QUIET))
+		if (refresh_and_write_cache(REFRESH_QUIET, 0, 0))
 			warning("could not refresh index");
 	} else {
 		struct child_process cp = CHILD_PROCESS_INIT;
@@ -497,6 +499,10 @@ static int do_apply_stash(const char *prefix, struct stash_info *info,
 		 */
 		cp.git_cmd = 1;
 		cp.dir = prefix;
+		argv_array_pushf(&cp.env_array, GIT_WORK_TREE_ENVIRONMENT"=%s",
+				 absolute_path(get_git_work_tree()));
+		argv_array_pushf(&cp.env_array, GIT_DIR_ENVIRONMENT"=%s",
+				 absolute_path(get_git_dir()));
 		argv_array_push(&cp.args, "status");
 		run_command(&cp);
 	}
@@ -713,11 +719,11 @@ static int git_stash_config(const char *var, const char *value, void *cb)
 static int show_stash(int argc, const char **argv, const char *prefix)
 {
 	int i;
-	int opts = 0;
 	int ret = 0;
 	struct stash_info info;
 	struct rev_info rev;
 	struct argv_array stash_args = ARGV_ARRAY_INIT;
+	struct argv_array revision_args = ARGV_ARRAY_INIT;
 	struct option options[] = {
 		OPT_END()
 	};
@@ -726,11 +732,12 @@ static int show_stash(int argc, const char **argv, const char *prefix)
 	git_config(git_diff_ui_config, NULL);
 	init_revisions(&rev, prefix);
 
+	argv_array_push(&revision_args, argv[0]);
 	for (i = 1; i < argc; i++) {
 		if (argv[i][0] != '-')
 			argv_array_push(&stash_args, argv[i]);
 		else
-			opts++;
+			argv_array_push(&revision_args, argv[i]);
 	}
 
 	ret = get_stash_info(&info, stash_args.argc, stash_args.argv);
@@ -742,7 +749,7 @@ static int show_stash(int argc, const char **argv, const char *prefix)
 	 * The config settings are applied only if there are not passed
 	 * any options.
 	 */
-	if (!opts) {
+	if (revision_args.argc == 1) {
 		git_config(git_stash_config, NULL);
 		if (show_stat)
 			rev.diffopt.output_format = DIFF_FORMAT_DIFFSTAT;
@@ -756,7 +763,7 @@ static int show_stash(int argc, const char **argv, const char *prefix)
 		}
 	}
 
-	argc = setup_revisions(argc, argv, &rev, NULL);
+	argc = setup_revisions(revision_args.argc, revision_args.argv, &rev, NULL);
 	if (argc > 1) {
 		free_stash_info(&info);
 		usage_with_options(git_stash_show_usage, options);
@@ -1131,7 +1138,10 @@ static int do_create_stash(const struct pathspec *ps, struct strbuf *stash_msg_b
 	prepare_fallback_ident("git stash", "git@stash");
 
 	read_cache_preload(NULL);
-	refresh_cache(REFRESH_QUIET);
+	if (refresh_and_write_cache(REFRESH_QUIET, 0, 0) < 0) {
+		ret = -1;
+		goto done;
+	}
 
 	if (get_oid("HEAD", &info->b_commit)) {
 		if (!quiet)
@@ -1292,7 +1302,7 @@ static int do_push_stash(const struct pathspec *ps, const char *stash_msg, int q
 		free(ps_matched);
 	}
 
-	if (refresh_cache(REFRESH_QUIET)) {
+	if (refresh_and_write_cache(REFRESH_QUIET, 0, 0)) {
 		ret = -1;
 		goto done;
 	}
@@ -1385,7 +1395,7 @@ static int do_push_stash(const struct pathspec *ps, const char *stash_msg, int q
 			struct child_process cp = CHILD_PROCESS_INIT;
 			cp.git_cmd = 1;
 			argv_array_pushl(&cp.args, "reset", "--hard", "-q",
-					 NULL);
+					 "--no-recurse-submodules", NULL);
 			if (run_command(&cp)) {
 				ret = -1;
 				goto done;
@@ -1393,30 +1403,16 @@ static int do_push_stash(const struct pathspec *ps, const char *stash_msg, int q
 		}
 
 		if (keep_index == 1 && !is_null_oid(&info.i_tree)) {
-			struct child_process cp_ls = CHILD_PROCESS_INIT;
-			struct child_process cp_checkout = CHILD_PROCESS_INIT;
-			struct strbuf out = STRBUF_INIT;
+			struct child_process cp = CHILD_PROCESS_INIT;
 
-			if (reset_tree(&info.i_tree, 0, 1)) {
-				ret = -1;
-				goto done;
-			}
-
-			cp_ls.git_cmd = 1;
-			argv_array_pushl(&cp_ls.args, "ls-files", "-z",
-					 "--modified", "--", NULL);
-
-			add_pathspecs(&cp_ls.args, ps);
-			if (pipe_command(&cp_ls, NULL, 0, &out, 0, NULL, 0)) {
-				ret = -1;
-				goto done;
-			}
-
-			cp_checkout.git_cmd = 1;
-			argv_array_pushl(&cp_checkout.args, "checkout-index",
-					 "-z", "--force", "--stdin", NULL);
-			if (pipe_command(&cp_checkout, out.buf, out.len, NULL,
-					 0, NULL, 0)) {
+			cp.git_cmd = 1;
+			argv_array_pushl(&cp.args, "checkout", "--no-overlay",
+					 oid_to_hex(&info.i_tree), "--", NULL);
+			if (!ps->nr)
+				argv_array_push(&cp.args, ":/");
+			else
+				add_pathspecs(&cp.args, ps);
+			if (run_command(&cp)) {
 				ret = -1;
 				goto done;
 			}

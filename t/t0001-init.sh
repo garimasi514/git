@@ -175,7 +175,7 @@ test_expect_success 'reinit' '
 test_expect_success 'init with --template' '
 	mkdir template-source &&
 	echo content >template-source/file &&
-	git init --template=../template-source template-custom &&
+	git init --template=template-source template-custom &&
 	test_cmp template-source/file template-custom/.git/file
 '
 
@@ -308,21 +308,11 @@ test_expect_success 'init prefers command line to GIT_DIR' '
 	test_path_is_missing otherdir/refs
 '
 
-downcase_on_case_insensitive_fs () {
-	test false = "$(git config --get core.filemode)" || return 0
-	for f
-	do
-		tr A-Z a-z <"$f" >"$f".downcased &&
-		mv -f "$f".downcased "$f" || return 1
-	done
-}
-
 test_expect_success 'init with separate gitdir' '
 	rm -rf newdir &&
 	git init --separate-git-dir realgitdir newdir &&
-	echo "gitdir: $(pwd)/realgitdir" >expected &&
-	downcase_on_case_insensitive_fs expected newdir/.git &&
-	test_cmp expected newdir/.git &&
+	newdir_git="$(cat newdir/.git)" &&
+	test_cmp_fspath "$(pwd)/realgitdir" "${newdir_git#gitdir: }" &&
 	test_path_is_dir realgitdir/refs
 '
 
@@ -371,13 +361,9 @@ test_expect_success 're-init on .git file' '
 '
 
 test_expect_success 're-init to update git link' '
-	(
-	cd newdir &&
-	git init --separate-git-dir ../surrealgitdir
-	) &&
-	echo "gitdir: $(pwd)/surrealgitdir" >expected &&
-	downcase_on_case_insensitive_fs expected newdir/.git &&
-	test_cmp expected newdir/.git &&
+	git -C newdir init --separate-git-dir ../surrealgitdir &&
+	newdir_git="$(cat newdir/.git)" &&
+	test_cmp_fspath "$(pwd)/surrealgitdir" "${newdir_git#gitdir: }" &&
 	test_path_is_dir surrealgitdir/refs &&
 	test_path_is_missing realgitdir/refs
 '
@@ -385,13 +371,9 @@ test_expect_success 're-init to update git link' '
 test_expect_success 're-init to move gitdir' '
 	rm -rf newdir realgitdir surrealgitdir &&
 	git init newdir &&
-	(
-	cd newdir &&
-	git init --separate-git-dir ../realgitdir
-	) &&
-	echo "gitdir: $(pwd)/realgitdir" >expected &&
-	downcase_on_case_insensitive_fs expected newdir/.git &&
-	test_cmp expected newdir/.git &&
+	git -C newdir init --separate-git-dir ../realgitdir &&
+	newdir_git="$(cat newdir/.git)" &&
+	test_cmp_fspath "$(pwd)/realgitdir" "${newdir_git#gitdir: }" &&
 	test_path_is_dir realgitdir/refs
 '
 
@@ -485,9 +467,8 @@ test_expect_success MINGW 'redirect std handles' '
 		GIT_REDIRECT_STDOUT=output.txt \
 		GIT_REDIRECT_STDERR="2>&1" \
 		git rev-parse --git-dir --verify refs/invalid &&
-	printf ".git\nfatal: Needed a single revision\n" >expect &&
-	sort <output.txt >output.sorted &&
-	test_cmp expect output.sorted
+	grep "^\\.git\$" output.txt &&
+	grep "Needed a single revision" output.txt
 '
 
 test_done

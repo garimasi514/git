@@ -77,7 +77,7 @@
 #endif
 /*
  * ARRAY_SIZE - get the number of elements in a visible array
- *  <at> x: the array whose size you want.
+ * @x: the array whose size you want.
  *
  * This does not work on pointers, or arrays declared as [], or
  * function parameters.  With correct compiler support, such usage
@@ -346,6 +346,7 @@ typedef uintmax_t timestamp_t;
 #define PRItime PRIuMAX
 #define parse_timestamp strtoumax
 #define TIME_MAX UINTMAX_MAX
+#define TIME_MIN 0
 
 #ifndef PATH_SEP
 #define PATH_SEP ':'
@@ -406,6 +407,10 @@ static inline char *git_find_last_dir_sep(const char *path)
 #define find_last_dir_sep git_find_last_dir_sep
 #endif
 
+#ifndef is_mount_point
+#define is_mount_point is_mount_point_via_stat
+#endif
+
 #ifndef create_symlink
 struct index_state;
 static inline int git_create_symlink(struct index_state *index, const char *target, const char *link)
@@ -413,10 +418,6 @@ static inline int git_create_symlink(struct index_state *index, const char *targ
 	return symlink(target, link);
 }
 #define create_symlink git_create_symlink
-#endif
-
-#ifndef is_mount_point
-#define is_mount_point is_mount_point_via_stat
 #endif
 
 #ifndef query_user_email
@@ -434,10 +435,6 @@ static inline int git_create_symlink(struct index_state *index, const char *targ
  */
 # define NSIG 100
 #endif
-#endif
-
-#ifndef git_program_data_config
-#define git_program_data_config() NULL
 #endif
 
 #if defined(__HP_cc) && (__HP_cc >= 61000)
@@ -837,9 +834,6 @@ const char *inet_ntop(int af, const void *src, char *dst, size_t size);
 int git_atexit(void (*handler)(void));
 #endif
 
-typedef void (*try_to_free_t)(size_t);
-try_to_free_t set_try_to_free_routine(try_to_free_t);
-
 static inline size_t st_add(size_t a, size_t b)
 {
 	if (unsigned_add_overflows(a, b))
@@ -1113,10 +1107,10 @@ static inline int strtol_i(char const *s, int base, int *result)
 	return 0;
 }
 
+void git_stable_qsort(void *base, size_t nmemb, size_t size,
+		      int(*compar)(const void *, const void *));
 #ifdef INTERNAL_QSORT
-void git_qsort(void *base, size_t nmemb, size_t size,
-	       int(*compar)(const void *, const void *));
-#define qsort git_qsort
+#define qsort git_stable_qsort
 #endif
 
 #define QSORT(base, n, compar) sane_qsort((base), (n), sizeof(*(base)), compar)
@@ -1126,6 +1120,9 @@ static inline void sane_qsort(void *base, size_t nmemb, size_t size,
 	if (nmemb > 1)
 		qsort(base, nmemb, size, compar);
 }
+
+#define STABLE_QSORT(base, n, compar) \
+	git_stable_qsort((base), (n), sizeof(*(base)), compar)
 
 #ifndef HAVE_ISO_QSORT_S
 int git_qsort_s(void *base, size_t nmemb, size_t size,
@@ -1369,5 +1366,43 @@ void unleak_memory(const void *ptr, size_t len);
  * replace system names.
  */
 #include "banned.h"
+
+/*
+ * container_of - Get the address of an object containing a field.
+ *
+ * @ptr: pointer to the field.
+ * @type: type of the object.
+ * @member: name of the field within the object.
+ */
+#define container_of(ptr, type, member) \
+	((type *) ((char *)(ptr) - offsetof(type, member)))
+
+/*
+ * helper function for `container_of_or_null' to avoid multiple
+ * evaluation of @ptr
+ */
+static inline void *container_of_or_null_offset(void *ptr, size_t offset)
+{
+	return ptr ? (char *)ptr - offset : NULL;
+}
+
+/*
+ * like `container_of', but allows returned value to be NULL
+ */
+#define container_of_or_null(ptr, type, member) \
+	(type *)container_of_or_null_offset(ptr, offsetof(type, member))
+
+/*
+ * like offsetof(), but takes a pointer to a a variable of type which
+ * contains @member, instead of a specified type.
+ * @ptr is subject to multiple evaluation since we can't rely on __typeof__
+ * everywhere.
+ */
+#if defined(__GNUC__) /* clang sets this, too */
+#define OFFSETOF_VAR(ptr, member) offsetof(__typeof__(*ptr), member)
+#else /* !__GNUC__ */
+#define OFFSETOF_VAR(ptr, member) \
+	((uintptr_t)&(ptr)->member - (uintptr_t)(ptr))
+#endif /* !__GNUC__ */
 
 #endif

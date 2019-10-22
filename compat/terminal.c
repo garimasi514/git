@@ -4,7 +4,6 @@
 #include "strbuf.h"
 #include "run-command.h"
 #include "string-list.h"
-#include "argv-array.h"
 #include "hashmap.h"
 
 #if defined(HAVE_DEV_TTY) || defined(GIT_WINDOWS_NATIVE)
@@ -350,8 +349,9 @@ static int is_known_escape_sequence(const char *sequence)
 				p[0] = '^';
 				p[1] = '[';
 				FLEX_ALLOC_MEM(e, sequence, p, comma - p);
-				hashmap_entry_init(e, strhash(e->sequence));
-				hashmap_add(&sequences, e);
+				hashmap_entry_init(&e->entry,
+						   strhash(e->sequence));
+				hashmap_add(&sequences, &e->entry);
 			}
 			if (!*eol)
 				break;

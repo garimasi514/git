@@ -98,6 +98,7 @@ struct diff_flags {
 	unsigned stat_with_summary;
 	unsigned suppress_diff_headers;
 	unsigned dual_color_diffed_diffs;
+	unsigned suppress_hunk_header_line_count;
 };
 
 static inline void diff_flags_or(struct diff_flags *a,
@@ -351,6 +352,7 @@ struct diff_filepair *diff_unmerge(struct diff_options *, const char *path);
 
 void compute_diffstat(struct diff_options *options, struct diffstat_t *diffstat,
 		      struct diff_queue_struct *q);
+void free_diffstat_info(struct diffstat_t *diffstat);
 
 #define DIFF_SETUP_REVERSE      	1
 #define DIFF_SETUP_USE_SIZE_CACHE	4
@@ -455,7 +457,8 @@ int run_diff_files(struct rev_info *revs, unsigned int option);
 int run_diff_index(struct rev_info *revs, int cached);
 
 int do_diff_cache(const struct object_id *, struct diff_options *);
-int diff_flush_patch_id(struct diff_options *, struct object_id *, int);
+int diff_flush_patch_id(struct diff_options *, struct object_id *, int, int);
+void flush_one_hunk(struct object_id *result, git_hash_ctx *ctx);
 
 int diff_result_code(struct diff_options *, int);
 

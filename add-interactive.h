@@ -20,7 +20,8 @@ struct add_i_state {
 	char *interactive_diff_filter, *interactive_diff_algorithm;
 };
 
-int init_add_i_state(struct repository *r, struct add_i_state *s);
+void init_add_i_state(struct add_i_state *s, struct repository *r);
+void clear_add_i_state(struct add_i_state *s);
 
 enum color_add_i {
 	COLOR_HEADER = 0,
@@ -43,6 +44,7 @@ enum add_p_mode {
 	ADD_P_STASH,
 	ADD_P_RESET,
 	ADD_P_CHECKOUT,
+	ADD_P_WORKTREE,
 };
 
 int run_add_p(struct repository *r, enum add_p_mode mode,

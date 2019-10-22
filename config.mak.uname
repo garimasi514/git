@@ -424,6 +424,11 @@ ifeq ($(uname_S),Windows)
 	NO_POSIX_GOODIES = UnfortunatelyYes
 	NATIVE_CRLF = YesPlease
 	DEFAULT_HELP_FORMAT = html
+ifeq (/mingw64,$(subst 32,64,$(prefix)))
+	# Move system config into top-level /etc/
+	ETC_GITCONFIG = ../etc/gitconfig
+	ETC_GITATTRIBUTES = ../etc/gitattributes
+endif
 
 	CC = compat/vcbuild/scripts/clink.pl
 	AR = compat/vcbuild/scripts/lib.pl
@@ -450,8 +455,10 @@ else
 endif
 	BASIC_CFLAGS += $(sdk_libs) $(msvc_libs)
 
+ifneq ($(USE_MSVC_CRTDBG),)
 	# Optionally enable memory leak reporting.
-	# BASIC_CLFAGS += -DUSE_MSVC_CRTDBG
+	BASIC_CFLAGS += -DUSE_MSVC_CRTDBG
+endif
 	BASIC_CFLAGS += -DPROTECT_NTFS_DEFAULT=1
 	# Always give "-Zi" to the compiler and "-debug" to linker (even in
 	# release mode) to force a PDB to be generated (like RelWithDebInfo).
@@ -630,7 +637,7 @@ ifneq (,$(wildcard ../THIS_IS_MSYSGIT))
 	INTERNAL_QSORT = YesPlease
 	HAVE_LIBCHARSET_H = YesPlease
 	NO_GETTEXT = YesPlease
-	COMPAT_CLFAGS += -D__USE_MINGW_ACCESS
+	COMPAT_CFLAGS += -D__USE_MINGW_ACCESS
 else
 	ifneq ($(shell expr "$(uname_R)" : '1\.'),2)
 		# MSys2
@@ -664,11 +671,15 @@ else
 		HAVE_LIBCHARSET_H = YesPlease
 		NO_GETTEXT =
 		USE_GETTEXT_SCHEME = fallthrough
-		USE_LIBPCRE= YesPlease
-		NO_LIBPCRE1_JIT = UnfortunatelyYes
+		USE_LIBPCRE = YesPlease
 		NO_CURL =
 		USE_NED_ALLOCATOR = YesPlease
 		NO_PYTHON =
+		ifeq (/mingw64,$(subst 32,64,$(prefix)))
+			# Move system config into top-level /etc/
+			ETC_GITCONFIG = ../etc/gitconfig
+			ETC_GITATTRIBUTES = ../etc/gitattributes
+		endif
 	else
 		COMPAT_CFLAGS += -D__USE_MINGW_ANSI_STDIO
 		NO_CURL = YesPlease
@@ -758,20 +769,24 @@ vcxproj:
 	perl contrib/buildsystems/generate -g Vcxproj
 	git add -f git.sln {*,*/lib,t/helper/*}/*.vcxproj
 
-	# Generate the LinkOrCopyBuiltins.targets file
+	# Generate the LinkOrCopyBuiltins.targets and LinkOrCopyRemoteHttp.targets file
 	(echo '<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">' && \
 	 echo '  <Target Name="CopyBuiltins_AfterBuild" AfterTargets="AfterBuild">' && \
 	 for name in $(BUILT_INS);\
 	 do \
 	   echo '    <Copy SourceFiles="$$(OutDir)\git.exe" DestinationFiles="$$(OutDir)\'"$$name"'" SkipUnchangedFiles="true" UseHardlinksIfPossible="true" />'; \
 	 done && \
+	 echo '  </Target>' && \
+	 echo '</Project>') >git/LinkOrCopyBuiltins.targets
+	(echo '<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">' && \
+	 echo '  <Target Name="CopyBuiltins_AfterBuild" AfterTargets="AfterBuild">' && \
 	 for name in $(REMOTE_CURL_ALIASES); \
 	 do \
 	   echo '    <Copy SourceFiles="$$(OutDir)\'"$(REMOTE_CURL_PRIMARY)"'" DestinationFiles="$$(OutDir)\'"$$name"'" SkipUnchangedFiles="true" UseHardlinksIfPossible="true" />'; \
 	 done && \
 	 echo '  </Target>' && \
-	 echo '</Project>') >git/LinkOrCopyBuiltins.targets
-	git add -f git/LinkOrCopyBuiltins.targets
+	 echo '</Project>') >git-remote-http/LinkOrCopyRemoteHttp.targets
+	git add -f git/LinkOrCopyBuiltins.targets git-remote-http/LinkOrCopyRemoteHttp.targets
 
 	# Add command-list.h
 	$(MAKE) MSVC=1 SKIP_VCPKG=1 prefix=/mingw64 command-list.h
@@ -779,11 +794,10 @@ vcxproj:
 
 	# Add scripts
 	rm -f perl/perl.mak
-	$(MAKE) MSVC=1 SKIP_VCPKG=1 prefix=/mingw64 \
-		$(SCRIPT_LIB) $(SCRIPT_SH_GEN) $(SCRIPT_PERL_GEN)
+	$(MAKE) MSVC=1 SKIP_VCPKG=1 prefix=/mingw64 $(SCRIPT_LIB) $(SCRIPTS)
 	# Strip out the sane tool path, needed only for building
 	sed -i '/^git_broken_path_fix ".*/d' git-sh-setup
-	git add -f $(SCRIPT_LIB) $(SCRIPT_SH_GEN) $(SCRIPT_PERL_GEN)
+	git add -f $(SCRIPT_LIB) $(SCRIPTS)
 
 	# Add Perl module
 	$(MAKE) $(LIB_PERL_GEN)
@@ -812,6 +826,10 @@ vcxproj:
 	# Add templates
 	$(MAKE) -C templates
 	git add -f templates/boilerplates.made templates/blt/
+
+	# Add the translated messages
+	make MSVC=1 SKIP_VCPKG=1 prefix=/mingw64 $(MOFILES)
+	git add -f $(MOFILES)
 
 	# Add build options
 	$(MAKE) MSVC=1 SKIP_VCPKG=1 prefix=/mingw64 GIT-BUILD-OPTIONS

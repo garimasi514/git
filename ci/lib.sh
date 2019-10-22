@@ -34,6 +34,11 @@ save_good_tree () {
 # successfully before (e.g. because the branch got rebased, changing only
 # the commit messages).
 skip_good_tree () {
+	if test "$TRAVIS_DEBUG_MODE" = true
+	then
+		return
+	fi
+
 	if ! good_tree_info="$(grep "^$(git rev-parse $CI_COMMIT^{tree}) " "$good_trees_file")"
 	then
 		# Haven't seen this tree yet, or no cached good trees file yet.
@@ -116,13 +121,6 @@ then
 	CI_OS_NAME="$(echo "$AGENT_OS" | tr A-Z a-z)"
 	test darwin != "$CI_OS_NAME" || CI_OS_NAME=osx
 	CI_REPO_SLUG="$(expr "$BUILD_REPOSITORY_URI" : '.*/\([^/]*/[^/]*\)$')"
-	jobs=10
-	if test -n "$MSVC"
-	then
-		CC=compat/vcbuild/scripts/clink.pl
-		jobname=windows-msvc
-		jobs=4
-	fi
 	CC="${CC:-gcc}"
 
 	# use a subdirectory of the cache dir (because the file share is shared
@@ -134,9 +132,9 @@ then
 	}
 
 	BREW_INSTALL_PACKAGES=gcc@8
-	export GIT_PROVE_OPTS="--timer --jobs $jobs --state=failed,slow,save"
+	export GIT_PROVE_OPTS="--timer --jobs 10 --state=failed,slow,save"
 	export GIT_TEST_OPTS="--verbose-log -x --write-junit-xml"
-	MAKEFLAGS="$MAKEFLAGS --jobs=$jobs"
+	MAKEFLAGS="$MAKEFLAGS --jobs=10"
 	test windows_nt != "$CI_OS_NAME" ||
 	GIT_TEST_OPTS="--no-chain-lint --no-bin-wrappers $GIT_TEST_OPTS"
 else
@@ -167,11 +165,13 @@ linux-clang|linux-gcc)
 		export CC=gcc-8
 	fi
 
-	export GIT_TEST_HTTPD=YesPlease
+	export GIT_TEST_HTTPD=true
 
 	# The Linux build installs the defined dependency versions below.
-	# The OS X build installs the latest available versions. Keep that
-	# in mind when you encounter a broken OS X build!
+	# The OS X build installs much more recent versions, whichever
+	# were recorded in the Homebrew database upon creating the OS X
+	# image.
+	# Keep that in mind when you encounter a broken OS X build!
 	export LINUX_P4_VERSION="16.2"
 	export LINUX_GIT_LFS_VERSION="1.5.2"
 
@@ -191,7 +191,7 @@ osx-clang|osx-gcc)
 	export GIT_SKIP_TESTS="t9810 t9816"
 	;;
 GIT_TEST_GETTEXT_POISON)
-	export GIT_TEST_GETTEXT_POISON=YesPlease
+	export GIT_TEST_GETTEXT_POISON=true
 	;;
 esac
 

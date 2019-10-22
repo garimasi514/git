@@ -57,10 +57,9 @@ struct commit *lookup_commit_or_die(const struct object_id *oid, const char *ref
 
 struct commit *lookup_commit(struct repository *r, const struct object_id *oid)
 {
-	struct object *obj = lookup_object(r, oid->hash);
+	struct object *obj = lookup_object(r, oid);
 	if (!obj)
-		return create_object(r, oid->hash,
-				     alloc_commit_node(r));
+		return create_object(r, oid, alloc_commit_node(r));
 	return object_as_type(r, obj, OBJ_COMMIT, 0);
 }
 
@@ -359,14 +358,15 @@ struct tree *repo_get_commit_tree(struct repository *r,
 
 struct object_id *get_commit_tree_oid(const struct commit *commit)
 {
-	return &get_commit_tree(commit)->object.oid;
+	struct tree *tree = get_commit_tree(commit);
+	return tree ? &tree->object.oid : NULL;
 }
 
 void release_commit_memory(struct parsed_object_pool *pool, struct commit *c)
 {
 	set_commit_tree(c, NULL);
-	c->index = 0;
 	free_commit_buffer(pool, c);
+	c->index = 0;
 	free_commit_list(c->parents);
 
 	c->object.parsed = 0;
@@ -449,7 +449,7 @@ int parse_commit_buffer(struct repository *r, struct commit *item, const void *b
 	item->date = parse_commit_date(bufptr, tail);
 
 	if (check_graph)
-		load_commit_graph_info(the_repository, item);
+		load_commit_graph_info(r, item);
 
 	return 0;
 }

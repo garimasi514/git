@@ -111,7 +111,7 @@ static void fsentry_init(struct fsentry *fse, struct fsentry *list,
 	fse->list = list;
 	fse->name = name;
 	fse->len = len;
-	hashmap_entry_init(fse, fsentry_hash(fse));
+	hashmap_entry_init(&fse->ent, fsentry_hash(fse));
 }
 
 /*
@@ -328,7 +328,7 @@ static void fscache_add(struct fscache *cache, struct fsentry *fse)
 		fse = fse->list;
 
 	for (; fse; fse = fse->next)
-		hashmap_add(&cache->map, fse);
+		hashmap_add(&cache->map, &fse->ent);
 }
 
 /*
@@ -339,7 +339,7 @@ static void fscache_clear(struct fscache *cache)
 	mem_pool_discard(cache->mem_pool, 0);
 	cache->mem_pool = NULL;
 	mem_pool_init(&cache->mem_pool, 0);
-	hashmap_free(&cache->map, 0);
+	hashmap_free(&cache->map);
 	hashmap_init(&cache->map, (hashmap_cmp_fn)fsentry_cmp, NULL, 0);
 	cache->lstat_requests = cache->opendir_requests = 0;
 	cache->fscache_misses = cache->fscache_requests = 0;
@@ -370,7 +370,7 @@ static struct fsentry *fscache_get(struct fscache *cache, struct fsentry *key)
 
 	cache->fscache_requests++;
 	/* check if entry is in cache */
-	fse = hashmap_get(&cache->map, key, NULL);
+	fse = hashmap_get_entry(&cache->map, key, ent, NULL);
 	if (fse) {
 		if (fse->st_mode)
 			fsentry_addref(fse);
@@ -380,7 +380,7 @@ static struct fsentry *fscache_get(struct fscache *cache, struct fsentry *key)
 	}
 	/* if looking for a file, check if directory listing is in cache */
 	if (!fse && key->list) {
-		fse = hashmap_get(&cache->map, key->list, NULL);
+		fse = hashmap_get_entry(&cache->map, key->list, ent, NULL);
 		if (fse) {
 			/*
 			 * dir entry without file entry, or dir does not
@@ -405,7 +405,7 @@ static struct fsentry *fscache_get(struct fscache *cache, struct fsentry *key)
 			fse = fsentry_alloc(cache, key->list->list,
 					    key->list->name, key->list->len);
 			fse->st_mode = 0;
-			hashmap_add(&cache->map, fse);
+			hashmap_add(&cache->map, &fse->ent);
 		}
 		return NULL;
 	}
@@ -416,7 +416,7 @@ static struct fsentry *fscache_get(struct fscache *cache, struct fsentry *key)
 
 	/* lookup file entry if requested (fse already points to directory) */
 	if (key->list)
-		fse = hashmap_get(&cache->map, key, NULL);
+		fse = hashmap_get_entry(&cache->map, key, ent, NULL);
 
 	if (fse && !fse->st_mode)
 		fse = NULL; /* non-existing directory */
@@ -515,7 +515,7 @@ void fscache_disable(void)
 			cache->lstat_requests, cache->opendir_requests,
 			cache->fscache_requests, cache->fscache_misses);
 		mem_pool_discard(cache->mem_pool, 0);
-		hashmap_free(&cache->map, 0);
+		hashmap_free(&cache->map);
 		free(cache);
 	}
 

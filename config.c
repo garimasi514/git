@@ -19,6 +19,7 @@
 #include "utf8.h"
 #include "dir.h"
 #include "color.h"
+#include "refs.h"
 
 struct config_source {
 	struct config_source *prev;
@@ -170,6 +171,12 @@ static int handle_path_include(const char *path, struct config_include_data *inc
 	return ret;
 }
 
+static void add_trailing_starstar_for_dir(struct strbuf *pat)
+{
+	if (pat->len && is_dir_sep(pat->buf[pat->len - 1]))
+		strbuf_addstr(pat, "**");
+}
+
 static int prepare_include_condition_pattern(struct strbuf *pat)
 {
 	struct strbuf path = STRBUF_INIT;
@@ -199,8 +206,7 @@ static int prepare_include_condition_pattern(struct strbuf *pat)
 	} else if (!is_absolute_path(pat->buf))
 		strbuf_insert(pat, 0, "**/", 3);
 
-	if (pat->len && is_dir_sep(pat->buf[pat->len - 1]))
-		strbuf_addstr(pat, "**");
+	add_trailing_starstar_for_dir(pat);
 
 	strbuf_release(&path);
 	return prefix;
@@ -264,6 +270,26 @@ done:
 	return ret;
 }
 
+static int include_by_branch(const char *cond, size_t cond_len)
+{
+	int flags;
+	int ret;
+	struct strbuf pattern = STRBUF_INIT;
+	const char *refname = !the_repository->gitdir ?
+		NULL : resolve_ref_unsafe("HEAD", 0, NULL, &flags);
+	const char *shortname;
+
+	if (!refname || !(flags & REF_ISSYMREF)	||
+			!skip_prefix(refname, "refs/heads/", &shortname))
+		return 0;
+
+	strbuf_add(&pattern, cond, cond_len);
+	add_trailing_starstar_for_dir(&pattern);
+	ret = !wildmatch(pattern.buf, shortname, WM_PATHNAME);
+	strbuf_release(&pattern);
+	return ret;
+}
+
 static int include_condition_is_true(const struct config_options *opts,
 				     const char *cond, size_t cond_len)
 {
@@ -272,6 +298,8 @@ static int include_condition_is_true(const struct config_options *opts,
 		return include_by_gitdir(opts, cond, cond_len, 0);
 	else if (skip_prefix_mem(cond, cond_len, "gitdir/i:", &cond, &cond_len))
 		return include_by_gitdir(opts, cond, cond_len, 1);
+	else if (skip_prefix_mem(cond, cond_len, "onbranch:", &cond, &cond_len))
+		return include_by_branch(cond, cond_len);
 
 	/* unknown conditionals are always false */
 	return 0;
@@ -834,22 +862,16 @@ static int git_parse_source(config_fn_t fn, void *data,
 	return error_return;
 }
 
-static int parse_unit_factor(const char *end, uintmax_t *val)
+static uintmax_t get_unit_factor(const char *end)
 {
 	if (!*end)
 		return 1;
-	else if (!strcasecmp(end, "k")) {
-		*val *= 1024;
-		return 1;
-	}
-	else if (!strcasecmp(end, "m")) {
-		*val *= 1024 * 1024;
-		return 1;
-	}
-	else if (!strcasecmp(end, "g")) {
-		*val *= 1024 * 1024 * 1024;
-		return 1;
-	}
+	else if (!strcasecmp(end, "k"))
+		return 1024;
+	else if (!strcasecmp(end, "m"))
+		return 1024 * 1024;
+	else if (!strcasecmp(end, "g"))
+		return 1024 * 1024 * 1024;
 	return 0;
 }
 
@@ -859,19 +881,20 @@ static int git_parse_signed(const char *value, intmax_t *ret, intmax_t max)
 		char *end;
 		intmax_t val;
 		uintmax_t uval;
-		uintmax_t factor = 1;
+		uintmax_t factor;
 
 		errno = 0;
 		val = strtoimax(value, &end, 0);
 		if (errno == ERANGE)
 			return 0;
-		if (!parse_unit_factor(end, &factor)) {
+		factor = get_unit_factor(end);
+		if (!factor) {
 			errno = EINVAL;
 			return 0;
 		}
 		uval = val < 0 ? -val : val;
-		uval *= factor;
-		if (uval > max || (val < 0 ? -val : val) > uval) {
+		if (unsigned_mult_overflows(factor, uval) ||
+		    factor * uval > max) {
 			errno = ERANGE;
 			return 0;
 		}
@@ -888,21 +911,23 @@ static int git_parse_unsigned(const char *value, uintmax_t *ret, uintmax_t max)
 	if (value && *value) {
 		char *end;
 		uintmax_t val;
-		uintmax_t oldval;
+		uintmax_t factor;
 
 		errno = 0;
 		val = strtoumax(value, &end, 0);
 		if (errno == ERANGE)
 			return 0;
-		oldval = val;
-		if (!parse_unit_factor(end, &val)) {
+		factor = get_unit_factor(end);
+		if (!factor) {
 			errno = EINVAL;
 			return 0;
 		}
-		if (val > max || oldval > val) {
+		if (unsigned_mult_overflows(factor, val) ||
+		    factor * val > max) {
 			errno = ERANGE;
 			return 0;
 		}
+		val *= factor;
 		*ret = val;
 		return 1;
 	}
@@ -949,34 +974,44 @@ int git_parse_ssize_t(const char *value, ssize_t *ret)
 NORETURN
 static void die_bad_number(const char *name, const char *value)
 {
-	const char * error_type = (errno == ERANGE)? _("out of range"):_("invalid unit");
+	const char *error_type = (errno == ERANGE) ?
+		N_("out of range") : N_("invalid unit");
+	const char *bad_numeric = N_("bad numeric config value '%s' for '%s': %s");
 
 	if (!value)
 		value = "";
 
+	if (!strcmp(name, "GIT_TEST_GETTEXT_POISON"))
+		/*
+		 * We explicitly *don't* use _() here since it would
+		 * cause an infinite loop with _() needing to call
+		 * use_gettext_poison(). This is why marked up
+		 * translations with N_() above.
+		 */
+		die(bad_numeric, value, name, error_type);
+
 	if (!(cf && cf->name))
-		die(_("bad numeric config value '%s' for '%s': %s"),
-		    value, name, error_type);
+		die(_(bad_numeric), value, name, _(error_type));
 
 	switch (cf->origin_type) {
 	case CONFIG_ORIGIN_BLOB:
 		die(_("bad numeric config value '%s' for '%s' in blob %s: %s"),
-		    value, name, cf->name, error_type);
+		    value, name, cf->name, _(error_type));
 	case CONFIG_ORIGIN_FILE:
 		die(_("bad numeric config value '%s' for '%s' in file %s: %s"),
-		    value, name, cf->name, error_type);
+		    value, name, cf->name, _(error_type));
 	case CONFIG_ORIGIN_STDIN:
 		die(_("bad numeric config value '%s' for '%s' in standard input: %s"),
-		    value, name, error_type);
+		    value, name, _(error_type));
 	case CONFIG_ORIGIN_SUBMODULE_BLOB:
 		die(_("bad numeric config value '%s' for '%s' in submodule-blob %s: %s"),
-		    value, name, cf->name, error_type);
+		    value, name, cf->name, _(error_type));
 	case CONFIG_ORIGIN_CMDLINE:
 		die(_("bad numeric config value '%s' for '%s' in command line %s: %s"),
-		    value, name, cf->name, error_type);
+		    value, name, cf->name, _(error_type));
 	default:
 		die(_("bad numeric config value '%s' for '%s' in %s: %s"),
-		    value, name, cf->name, error_type);
+		    value, name, cf->name, _(error_type));
 	}
 }
 
@@ -1169,7 +1204,7 @@ static int git_default_core_config(const char *var, const char *value, void *cb)
 			default_abbrev = -1;
 		else {
 			int abbrev = git_config_int(var, value);
-			if (abbrev < minimum_abbrev || abbrev > 40)
+			if (abbrev < minimum_abbrev || abbrev > the_hash_algo->hexsz)
 				return error(_("abbrev length out of range: %d"), abbrev);
 			default_abbrev = abbrev;
 		}
@@ -1342,11 +1377,6 @@ static int git_default_core_config(const char *var, const char *value, void *cb)
 	if (!strcmp(var, "core.protectntfs")) {
 		protect_ntfs = git_config_bool(var, value);
 		return 0;
-	}
-
-	if (!strcmp(var, "core.partialclonefilter")) {
-		return git_config_string(&core_partial_clone_filter_default,
-					 var, value);
 	}
 
 	if (!strcmp(var, "core.usereplacerefs")) {
@@ -1676,16 +1706,11 @@ static int do_git_config_sequence(const struct config_options *opts,
 		repo_config = NULL;
 
 	current_parsing_scope = CONFIG_SCOPE_SYSTEM;
-	if (git_config_system()) {
-		int flags = opts->system_gently ? ACCESS_EACCES_OK : 0;
-		const char *program_data = git_program_data_config();
-		const char *etc = git_etc_gitconfig();
-
-		if (program_data && !access_or_die(program_data, R_OK, flags))
-			ret += git_config_from_file(fn, program_data, data);
-		if (!access_or_die(etc, R_OK, flags))
-			ret += git_config_from_file(fn, etc, data);
-	}
+	if (git_config_system() && !access_or_die(git_etc_gitconfig(), R_OK,
+						  opts->system_gently ?
+						  ACCESS_EACCES_OK : 0))
+		ret += git_config_from_file(fn, git_etc_gitconfig(),
+					    data);
 
 	current_parsing_scope = CONFIG_SCOPE_GLOBAL;
 	if (xdg_config && !access_or_die(xdg_config, R_OK, ACCESS_EACCES_OK))
@@ -1831,9 +1856,9 @@ static struct config_set_element *configset_find_element(struct config_set *cs, 
 	if (git_config_parse_key(key, &normalized_key, NULL))
 		return NULL;
 
-	hashmap_entry_init(&k, strhash(normalized_key));
+	hashmap_entry_init(&k.ent, strhash(normalized_key));
 	k.key = normalized_key;
-	found_entry = hashmap_get(&cs->config_hash, &k, NULL);
+	found_entry = hashmap_get_entry(&cs->config_hash, &k, ent, NULL);
 	free(normalized_key);
 	return found_entry;
 }
@@ -1852,10 +1877,10 @@ static int configset_add_value(struct config_set *cs, const char *key, const cha
 	 */
 	if (!e) {
 		e = xmalloc(sizeof(*e));
-		hashmap_entry_init(e, strhash(key));
+		hashmap_entry_init(&e->ent, strhash(key));
 		e->key = xstrdup(key);
 		string_list_init(&e->value_list, 1);
-		hashmap_add(&cs->config_hash, e);
+		hashmap_add(&cs->config_hash, &e->ent);
 	}
 	si = string_list_append_nodup(&e->value_list, xstrdup_or_null(value));
 
@@ -1883,12 +1908,14 @@ static int configset_add_value(struct config_set *cs, const char *key, const cha
 }
 
 static int config_set_element_cmp(const void *unused_cmp_data,
-				  const void *entry,
-				  const void *entry_or_key,
+				  const struct hashmap_entry *eptr,
+				  const struct hashmap_entry *entry_or_key,
 				  const void *unused_keydata)
 {
-	const struct config_set_element *e1 = entry;
-	const struct config_set_element *e2 = entry_or_key;
+	const struct config_set_element *e1, *e2;
+
+	e1 = container_of(eptr, const struct config_set_element, ent);
+	e2 = container_of(entry_or_key, const struct config_set_element, ent);
 
 	return strcmp(e1->key, e2->key);
 }
@@ -1909,12 +1936,12 @@ void git_configset_clear(struct config_set *cs)
 	if (!cs->hash_initialized)
 		return;
 
-	hashmap_iter_init(&cs->config_hash, &iter);
-	while ((entry = hashmap_iter_next(&iter))) {
+	hashmap_for_each_entry(&cs->config_hash, &iter, entry,
+				ent /* member name */) {
 		free(entry->key);
 		string_list_clear(&entry->value_list, 1);
 	}
-	hashmap_free(&cs->config_hash, 1);
+	hashmap_free_entries(&cs->config_hash, struct config_set_element, ent);
 	cs->hash_initialized = 0;
 	free(cs->list.items);
 	cs->list.nr = 0;
@@ -2256,30 +2283,6 @@ int git_config_get_expiry_in_days(const char *key, timestamp_t *expiry, timestam
 		return 0;
 	}
 	return -1; /* thing exists but cannot be parsed */
-}
-
-int git_config_get_untracked_cache(void)
-{
-	int val = -1;
-	const char *v;
-
-	/* Hack for test programs like test-dump-untracked-cache */
-	if (ignore_untracked_cache_config)
-		return -1;
-
-	if (!git_config_get_maybe_bool("core.untrackedcache", &val))
-		return val;
-
-	if (!git_config_get_value("core.untrackedcache", &v)) {
-		if (!strcasecmp(v, "keep"))
-			return -1;
-
-		error(_("unknown core.untrackedCache value '%s'; "
-			"using 'keep' default value"), v);
-		return -1;
-	}
-
-	return -1; /* default value */
 }
 
 int git_config_get_split_index(void)

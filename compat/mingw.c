@@ -1530,11 +1530,6 @@ static int wenvcmp(const void *a, const void *b)
 	return _wcsnicmp(p, q, p_len);
 }
 
-/* We need a stable sort to convert the environment between UTF-16 <-> UTF-8 */
-#ifndef INTERNAL_QSORT
-#include "qsort.c"
-#endif
-
 /*
  * Build an environment block combining the inherited environment
  * merged with the given list of settings.
@@ -1566,15 +1561,15 @@ static wchar_t *make_environment_block(char **deltaenv)
 		}
 
 		ALLOC_ARRAY(result, size);
-		memcpy(result, wenv, size * sizeof(*wenv));
+		COPY_ARRAY(result, wenv, size);
 		FreeEnvironmentStringsW(wenv);
 		return result;
 	}
 
 	/*
 	 * If there is a deltaenv, let's accumulate all keys into `array`,
-	 * sort them using the stable git_qsort() and then copy, skipping
-	 * duplicate keys
+	 * sort them using the stable git_stable_qsort() and then copy,
+	 * skipping duplicate keys
 	 */
 	for (p = wenv; p && *p; ) {
 		ALLOC_GROW(array, nr + 1, alloc);
@@ -1597,7 +1592,7 @@ static wchar_t *make_environment_block(char **deltaenv)
 		p += wlen + 1;
 	}
 
-	git_qsort(array, nr, sizeof(*array), wenvcmp);
+	git_stable_qsort(array, nr, sizeof(*array), wenvcmp);
 	ALLOC_ARRAY(result, size + delta_size);
 
 	for (p = result, i = 0; i < nr; i++) {
@@ -1610,7 +1605,7 @@ static wchar_t *make_environment_block(char **deltaenv)
 			continue;
 
 		size = wcslen(array[i]) + 1;
-		memcpy(p, array[i], size * sizeof(*p));
+		COPY_ARRAY(p, array[i], size);
 		p += size;
 	}
 	*p = L'\0';
@@ -2403,7 +2398,7 @@ struct passwd *getpwuid(int uid)
 	if (initialized)
 		return p;
 
-	len = sizeof(buf);
+	len = ARRAY_SIZE(buf);
 	if (!GetUserNameW(buf, &len)) {
 		initialized = 1;
 		return NULL;
@@ -2574,14 +2569,6 @@ int mingw_raise(int sig)
 		return 0;
 
 #if defined(_MSC_VER)
-		/*
-		 * <signal.h> in the CRT defines 8 signals as being
-		 * supported on the platform.  Anything else causes
-		 * an "Invalid signal or error" (which in DEBUG builds
-		 * causes the Abort/Retry/Ignore dialog).  We by-pass
-		 * the CRT for things we already know will fail.
-		 */
-		/*case SIGINT:*/
 	case SIGILL:
 	case SIGFPE:
 	case SIGSEGV:
@@ -2589,6 +2576,13 @@ int mingw_raise(int sig)
 	case SIGBREAK:
 	case SIGABRT:
 	case SIGABRT_COMPAT:
+		/*
+		 * The <signal.h> header in the MS C Runtime defines 8 signals
+		 * as being supported on the platform. Anything else causes an
+		 * "Invalid signal or error" (which in DEBUG builds causes the
+		 * Abort/Retry/Ignore dialog). We by-pass the CRT for things we
+		 * already know will fail.
+		 */
 		return raise(sig);
 	default:
 		errno = EINVAL;
@@ -3296,20 +3290,6 @@ int uname(struct utsname *buf)
 	xsnprintf(buf->version, sizeof(buf->version),
 		  "%u", (v >> 16) & 0x7fff);
 	return 0;
-}
-
-const char *program_data_config(void)
-{
-	static struct strbuf path = STRBUF_INIT;
-	static unsigned initialized;
-
-	if (!initialized) {
-		const char *env = mingw_getenv("PROGRAMDATA");
-		if (env)
-			strbuf_addf(&path, "%s/Git/config", env);
-		initialized = 1;
-	}
-	return *path.buf ? path.buf : NULL;
 }
 
 /*

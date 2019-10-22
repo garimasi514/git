@@ -58,8 +58,10 @@ static int task_finished(int result,
 struct testsuite {
 	struct string_list tests, failed;
 	int next;
-	int quiet, immediate, verbose, trace;
+	int quiet, immediate, verbose, verbose_log, trace, write_junit_xml;
 };
+#define TESTSUITE_INIT \
+	{ STRING_LIST_INIT_DUP, STRING_LIST_INIT_DUP, -1, 0, 0, 0, 0, 0, 0 }
 
 static int next_test(struct child_process *cp, struct strbuf *err, void *cb,
 		     void **task_cb)
@@ -77,8 +79,12 @@ static int next_test(struct child_process *cp, struct strbuf *err, void *cb,
 		argv_array_push(&cp->args, "-i");
 	if (suite->verbose)
 		argv_array_push(&cp->args, "-v");
+	if (suite->verbose_log)
+		argv_array_push(&cp->args, "-V");
 	if (suite->trace)
 		argv_array_push(&cp->args, "-x");
+	if (suite->write_junit_xml)
+		argv_array_push(&cp->args, "--write-junit-xml");
 
 	strbuf_addf(err, "Output of '%s':\n", test);
 	*task_cb = (void *)test;
@@ -118,7 +124,7 @@ static const char * const testsuite_usage[] = {
 
 static int testsuite(int argc, const char **argv)
 {
-	struct testsuite suite;
+	struct testsuite suite = TESTSUITE_INIT;
 	int max_jobs = 1, i, ret;
 	DIR *dir;
 	struct dirent *d;
@@ -128,7 +134,11 @@ static int testsuite(int argc, const char **argv)
 		OPT_INTEGER('j', "jobs", &max_jobs, "run <N> jobs in parallel"),
 		OPT_BOOL('q', "quiet", &suite.quiet, "be terse"),
 		OPT_BOOL('v', "verbose", &suite.verbose, "be verbose"),
+		OPT_BOOL('V', "verbose-log", &suite.verbose_log,
+			 "be verbose, redirected to a file"),
 		OPT_BOOL('x', "trace", &suite.trace, "trace shell commands"),
+		OPT_BOOL(0, "write-junit-xml", &suite.write_junit_xml,
+			 "write JUnit-style XML files"),
 		OPT_END()
 	};
 
@@ -237,9 +247,6 @@ int cmd__run_command(int argc, const char **argv)
 
 	if (argc > 1 && !strcmp(argv[1], "testsuite"))
 		exit(testsuite(argc - 1, argv + 1));
-
-	if (argc < 2)
-		return 1;
 	if (!strcmp(argv[1], "inherited-handle"))
 		exit(inherit_handle(argv[0]));
 	if (!strcmp(argv[1], "inherited-handle-child"))

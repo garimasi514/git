@@ -240,16 +240,31 @@ test_expect_success 'refresh index before checking if it is up-to-date' '
 '
 
 test_expect_success 'choking "git rm" should not let it die with cruft' '
+	test_oid_init &&
 	git reset -q --hard &&
 	test_when_finished "rm -f .git/index.lock && git reset -q --hard" &&
 	i=0 &&
+	hash=$(test_oid deadbeef) &&
 	while test $i -lt 12000
 	do
-		echo "100644 1234567890123456789012345678901234567890 0	some-file-$i"
+		echo "100644 $hash 0	some-file-$i"
 		i=$(( $i + 1 ))
 	done | git update-index --index-info &&
 	git rm -n "some-file-*" | : &&
 	test_path_is_missing .git/index.lock
+'
+
+test_expect_success 'Resolving by removal is not a warning-worthy event' '
+	git reset -q --hard &&
+	test_when_finished "rm -f .git/index.lock msg && git reset -q --hard" &&
+	blob=$(echo blob | git hash-object -w --stdin) &&
+	for stage in 1 2 3
+	do
+		echo "100644 $blob $stage	blob"
+	done | git update-index --index-info &&
+	git rm blob >msg 2>&1 &&
+	test_i18ngrep ! "needs merge" msg &&
+	test_must_fail git ls-files -s --error-unmatch blob
 '
 
 test_expect_success 'rm removes subdirectories recursively' '

@@ -5,11 +5,9 @@
 #include "diffcore.h"
 #include "revision.h"
 #include "refs.h"
-#include "prefix-map.h"
+#include "string-list.h"
 #include "lockfile.h"
-#include "pathspec.h"
 #include "dir.h"
-#include "argv-array.h"
 #include "run-command.h"
 
 static void init_color(struct repository *r, struct add_i_state *s,
@@ -28,7 +26,7 @@ static void init_color(struct repository *r, struct add_i_state *s,
 	free(key);
 }
 
-int init_add_i_state(struct repository *r, struct add_i_state *s)
+void init_add_i_state(struct add_i_state *s, struct repository *r)
 {
 	const char *value;
 
@@ -46,72 +44,184 @@ int init_add_i_state(struct repository *r, struct add_i_state *s)
 	init_color(r, s, "prompt", s->prompt_color, GIT_COLOR_BOLD_BLUE);
 	init_color(r, s, "error", s->error_color, GIT_COLOR_BOLD_RED);
 	init_color(r, s, "reset", s->reset_color, GIT_COLOR_RESET);
+	init_color(r, s, "fraginfo", s->fraginfo_color,
+		   diff_get_color(s->use_color, DIFF_FRAGINFO));
+	init_color(r, s, "context", s->context_color,
+		diff_get_color(s->use_color, DIFF_CONTEXT));
+	init_color(r, s, "old", s->file_old_color,
+		diff_get_color(s->use_color, DIFF_FILE_OLD));
+	init_color(r, s, "new", s->file_new_color,
+		diff_get_color(s->use_color, DIFF_FILE_NEW));
 
-	strlcpy(s->fraginfo_color,
-		diff_get_color(s->use_color, DIFF_FRAGINFO), COLOR_MAXLEN);
-	strlcpy(s->context_color,
-		diff_get_color(s->use_color, DIFF_CONTEXT), COLOR_MAXLEN);
-	strlcpy(s->file_old_color,
-		diff_get_color(s->use_color, DIFF_FILE_OLD), COLOR_MAXLEN);
-	strlcpy(s->file_new_color,
-		diff_get_color(s->use_color, DIFF_FILE_NEW), COLOR_MAXLEN);
+	FREE_AND_NULL(s->interactive_diff_filter);
+	git_config_get_string("interactive.difffilter",
+			      &s->interactive_diff_filter);
 
-	free(s->interactive_diff_filter);
-	if (git_config_get_string("interactive.difffilter",
-				  &s->interactive_diff_filter))
-		s->interactive_diff_filter = NULL;
+	FREE_AND_NULL(s->interactive_diff_algorithm);
+	git_config_get_string("diff.algorithm",
+			      &s->interactive_diff_algorithm);
 
-	free(s->interactive_diff_algorithm);
-	if (git_config_get_string("diff.algorithm",
-				  &s->interactive_diff_algorithm))
-		s->interactive_diff_algorithm = NULL;
-
-	if (git_config_get_bool("interactive.singlekey",
-				&s->use_single_key))
-		s->use_single_key = 0;
-
-	return 0;
+	git_config_get_bool("interactive.singlekey", &s->use_single_key);
 }
 
-static ssize_t find_unique(const char *string,
-			   struct prefix_item **list, size_t nr)
+void clear_add_i_state(struct add_i_state *s)
 {
-	ssize_t found = -1, i;
+	FREE_AND_NULL(s->interactive_diff_filter);
+	FREE_AND_NULL(s->interactive_diff_algorithm);
+	memset(s, 0, sizeof(*s));
+	s->use_color = -1;
+}
 
-	for (i = 0; i < nr; i++) {
-		struct prefix_item *item = list[i];
-		if (!starts_with(item->name, string))
-			continue;
-		if (found >= 0)
-			return -1;
-		found = i;
+/*
+ * A "prefix item list" is a list of items that are identified by a string, and
+ * a unique prefix (if any) is determined for each item.
+ *
+ * It is implemented in the form of a pair of `string_list`s, the first one
+ * duplicating the strings, with the `util` field pointing at a structure whose
+ * first field must be `size_t prefix_length`.
+ *
+ * That `prefix_length` field will be computed by `find_unique_prefixes()`; It
+ * will be set to zero if no valid, unique prefix could be found.
+ *
+ * The second `string_list` is called `sorted` and does _not_ duplicate the
+ * strings but simply reuses the first one's, with the `util` field pointing at
+ * the `string_item_list` of the first `string_list`. It  will be populated and
+ * sorted by `find_unique_prefixes()`.
+ */
+struct prefix_item_list {
+	struct string_list items;
+	struct string_list sorted;
+	int *selected; /* for multi-selections */
+	size_t min_length, max_length;
+};
+#define PREFIX_ITEM_LIST_INIT \
+	{ STRING_LIST_INIT_DUP, STRING_LIST_INIT_NODUP, NULL, 1, 4 }
+
+static void prefix_item_list_clear(struct prefix_item_list *list)
+{
+	string_list_clear(&list->items, 1);
+	string_list_clear(&list->sorted, 0);
+	FREE_AND_NULL(list->selected);
+}
+
+static void extend_prefix_length(struct string_list_item *p,
+				 const char *other_string, size_t max_length)
+{
+	size_t *len = p->util;
+
+	if (!*len || memcmp(p->string, other_string, *len))
+		return;
+
+	for (;;) {
+		char c = p->string[*len];
+
+		/*
+		 * Is `p` a strict prefix of `other`? Or have we exhausted the
+		 * maximal length of the prefix? Or is the current character a
+		 * multi-byte UTF-8 one? If so, there is no valid, unique
+		 * prefix.
+		 */
+		if (!c || ++*len > max_length || !isascii(c)) {
+			*len = 0;
+			break;
+		}
+
+		if (c != other_string[*len - 1])
+			break;
+	}
+}
+
+static void find_unique_prefixes(struct prefix_item_list *list)
+{
+	size_t i;
+
+	if (list->sorted.nr == list->items.nr)
+		return;
+
+	string_list_clear(&list->sorted, 0);
+	/* Avoid reallocating incrementally */
+	list->sorted.items = xmalloc(st_mult(sizeof(*list->sorted.items),
+					     list->items.nr));
+	list->sorted.nr = list->sorted.alloc = list->items.nr;
+
+	for (i = 0; i < list->items.nr; i++) {
+		list->sorted.items[i].string = list->items.items[i].string;
+		list->sorted.items[i].util = list->items.items + i;
 	}
 
-	return found;
+	string_list_sort(&list->sorted);
+
+	for (i = 0; i < list->sorted.nr; i++) {
+		struct string_list_item *sorted_item = list->sorted.items + i;
+		struct string_list_item *item = sorted_item->util;
+		size_t *len = item->util;
+
+		*len = 0;
+		while (*len < list->min_length) {
+			char c = item->string[(*len)++];
+
+			if (!c || !isascii(c)) {
+				*len = 0;
+				break;
+			}
+		}
+
+		if (i > 0)
+			extend_prefix_length(item, sorted_item[-1].string,
+					     list->max_length);
+		if (i + 1 < list->sorted.nr)
+			extend_prefix_length(item, sorted_item[1].string,
+					     list->max_length);
+	}
+}
+
+static ssize_t find_unique(const char *string, struct prefix_item_list *list)
+{
+	int index = string_list_find_insert_index(&list->sorted, string, 1);
+	struct string_list_item *item;
+
+	if (list->items.nr != list->sorted.nr)
+		BUG("prefix_item_list in inconsistent state (%"PRIuMAX
+		    " vs %"PRIuMAX")",
+		    (uintmax_t)list->items.nr, (uintmax_t)list->sorted.nr);
+
+	if (index < 0)
+		item = list->sorted.items[-1 - index].util;
+	else if (index > 0 &&
+		 starts_with(list->sorted.items[index - 1].string, string))
+		return -1;
+	else if (index + 1 < list->sorted.nr &&
+		 starts_with(list->sorted.items[index + 1].string, string))
+		return -1;
+	else if (index < list->sorted.nr)
+		item = list->sorted.items[index].util;
+	else
+		return -1;
+	return item - list->items.items;
 }
 
 struct list_options {
 	int columns;
 	const char *header;
-	void (*print_item)(int i, int selected, struct prefix_item *item,
+	void (*print_item)(int i, int selected, struct string_list_item *item,
 			   void *print_item_data);
 	void *print_item_data;
 };
 
-static void list(struct prefix_item **list, int *selected, size_t nr,
-		 struct add_i_state *s, struct list_options *opts)
+static void list(struct add_i_state *s, struct string_list *list, int *selected,
+		 struct list_options *opts)
 {
 	int i, last_lf = 0;
 
-	if (!nr)
+	if (!list->nr)
 		return;
 
 	if (opts->header)
 		color_fprintf_ln(stdout, s->header_color,
 				 "%s", opts->header);
 
-	for (i = 0; i < nr; i++) {
-		opts->print_item(i, selected ? selected[i] : 0, list[i],
+	for (i = 0; i < list->nr; i++) {
+		opts->print_item(i, selected ? selected[i] : 0, list->items + i,
 				 opts->print_item_data);
 
 		if ((opts->columns) && ((i + 1) % (opts->columns))) {
@@ -148,8 +258,8 @@ struct list_and_choose_options {
  * If an error occurred, returns `LIST_AND_CHOOSE_ERROR`. Upon EOF,
  * `LIST_AND_CHOOSE_QUIT` is returned.
  */
-static ssize_t list_and_choose(struct prefix_item **items, int *selected,
-			       size_t nr, struct add_i_state *s,
+static ssize_t list_and_choose(struct add_i_state *s,
+			       struct prefix_item_list *items,
 			       struct list_and_choose_options *opts)
 {
 	int singleton = opts->flags & SINGLETON;
@@ -158,20 +268,22 @@ static ssize_t list_and_choose(struct prefix_item **items, int *selected,
 	struct strbuf input = STRBUF_INIT;
 	ssize_t res = singleton ? LIST_AND_CHOOSE_ERROR : 0;
 
-	if (!selected && !singleton)
-		BUG("need a selected array in non-singleton mode");
+	if (!singleton) {
+		free(items->selected);
+		CALLOC_ARRAY(items->selected, items->items.nr);
+	}
 
 	if (singleton && !immediate)
 		BUG("singleton requires immediate");
 
-	find_unique_prefixes(items, nr, 1, 4);
+	find_unique_prefixes(items);
 
 	for (;;) {
 		char *p, *endp;
 
 		strbuf_reset(&input);
 
-		list(items, selected, nr, s, &opts->list_opts);
+		list(s, &items->items, items->selected, &opts->list_opts);
 
 		color_fprintf(stdout, s->prompt_color, "%s", opts->prompt);
 		fputs(singleton ? "> " : ">> ", stdout);
@@ -207,7 +319,7 @@ static ssize_t list_and_choose(struct prefix_item **items, int *selected,
 				continue;
 			}
 
-			/* Input that begins with '-'; unchoose */
+			/* Input that begins with '-'; de-select */
 			if (*p == '-') {
 				choose = 0;
 				p++;
@@ -216,7 +328,7 @@ static ssize_t list_and_choose(struct prefix_item **items, int *selected,
 
 			if (sep == 1 && *p == '*') {
 				from = 0;
-				to = nr;
+				to = items->items.nr;
 			} else if (isdigit(*p)) {
 				/* A range can be specified like 5-7 or 5-. */
 				from = strtoul(p, &endp, 10) - 1;
@@ -232,12 +344,12 @@ static ssize_t list_and_choose(struct prefix_item **items, int *selected,
 
 			p[sep] = '\0';
 			if (from < 0) {
-				from = find_unique(p, items, nr);
+				from = find_unique(p, items);
 				if (from >= 0)
 					to = from + 1;
 			}
 
-			if (from < 0 || from >= nr ||
+			if (from < 0 || from >= items->items.nr ||
 			    (singleton && from + 1 != to)) {
 				color_fprintf_ln(stdout, s->error_color,
 						 _("Huh (%s)?"), p);
@@ -247,12 +359,12 @@ static ssize_t list_and_choose(struct prefix_item **items, int *selected,
 				break;
 			}
 
-			if (to > nr)
-				to = nr;
+			if (to > items->items.nr)
+				to = items->items.nr;
 
 			for (; from < to; from++)
-				if (selected[from] != choose) {
-					selected[from] = choose;
+				if (items->selected[from] != choose) {
+					items->selected[from] = choose;
 					res += choose ? +1 : -1;
 				}
 
@@ -273,62 +385,35 @@ struct adddel {
 	unsigned seen:1, unmerged:1, binary:1;
 };
 
-struct file_list {
-	struct file_item {
-		struct prefix_item item;
-		struct adddel index, worktree;
-	} **file;
-	size_t nr, alloc;
+struct file_item {
+	size_t prefix_length;
+	struct adddel index, worktree;
 };
 
-static void add_file_item(struct file_list *list, const char *name)
+static void add_file_item(struct string_list *files, const char *name)
 {
-	struct file_item *item;
+	struct file_item *item = xcalloc(sizeof(*item), 1);
 
-	FLEXPTR_ALLOC_STR(item, item.name, name);
-
-	ALLOC_GROW(list->file, list->nr + 1, list->alloc);
-	list->file[list->nr++] = item;
-}
-
-static void reset_file_list(struct file_list *list)
-{
-	size_t i;
-
-	for (i = 0; i < list->nr; i++)
-		free(list->file[i]);
-	list->nr = 0;
-}
-
-static void release_file_list(struct file_list *list)
-{
-	reset_file_list(list);
-	FREE_AND_NULL(list->file);
-	list->alloc = 0;
-}
-
-static int file_item_cmp(const void *a, const void *b)
-{
-	const struct file_item * const *f1 = a;
-	const struct file_item * const *f2 = b;
-
-	return strcmp((*f1)->item.name, (*f2)->item.name);
+	string_list_append(files, name)->util = item;
 }
 
 struct pathname_entry {
 	struct hashmap_entry ent;
-	size_t index;
-	char pathname[FLEX_ARRAY];
+	const char *name;
+	struct file_item *item;
 };
 
 static int pathname_entry_cmp(const void *unused_cmp_data,
-			      const void *entry, const void *entry_or_key,
-			      const void *pathname)
+			      const struct hashmap_entry *he1,
+			      const struct hashmap_entry *he2,
+			      const void *name)
 {
-	const struct pathname_entry *e1 = entry, *e2 = entry_or_key;
+	const struct pathname_entry *e1 =
+		container_of(he1, const struct pathname_entry, ent);
+	const struct pathname_entry *e2 =
+		container_of(he2, const struct pathname_entry, ent);
 
-	return strcmp(e1->pathname,
-		      pathname ? (const char *)pathname : e2->pathname);
+	return strcmp(e1->name, name ? (const char *)name : e2->name);
 }
 
 struct collection_status {
@@ -338,7 +423,7 @@ struct collection_status {
 
 	unsigned skip_unseen:1;
 	size_t unmerged_count, binary_count;
-	struct file_list *list;
+	struct string_list *files;
 	struct hashmap file_map;
 };
 
@@ -359,29 +444,29 @@ static void collect_changes_cb(struct diff_queue_struct *q,
 		const char *name = stat.files[i]->name;
 		int hash = strhash(name);
 		struct pathname_entry *entry;
-		size_t file_index;
-		struct file_item *file;
+		struct file_item *file_item;
 		struct adddel *adddel, *other_adddel;
 
-		entry = hashmap_get_from_hash(&s->file_map, hash, name);
-		if (entry) {
-			if (entry->index == (size_t)-1)
+		entry = hashmap_get_entry_from_hash(&s->file_map, hash, name,
+						    struct pathname_entry, ent);
+		if (!entry) {
+			if (s->skip_unseen)
 				continue;
-			file_index = entry->index;
-		} else if (s->skip_unseen)
-			continue;
-		else {
-			FLEX_ALLOC_STR(entry, pathname, name);
-			hashmap_entry_init(entry, hash);
-			entry->index = file_index = s->list->nr;
-			hashmap_add(&s->file_map, entry);
 
-			add_file_item(s->list, name);
+			add_file_item(s->files, name);
+
+			entry = xcalloc(sizeof(*entry), 1);
+			hashmap_entry_init(&entry->ent, hash);
+			entry->name = s->files->items[s->files->nr - 1].string;
+			entry->item = s->files->items[s->files->nr - 1].util;
+			hashmap_add(&s->file_map, &entry->ent);
 		}
-		file = s->list->file[file_index];
 
-		adddel = s->phase == FROM_INDEX ? &file->index : &file->worktree;
-		other_adddel = s->phase == FROM_INDEX ? &file->worktree : &file->index;
+		file_item = entry->item;
+		adddel = s->phase == FROM_INDEX ?
+			&file_item->index : &file_item->worktree;
+		other_adddel = s->phase == FROM_INDEX ?
+			&file_item->worktree : &file_item->index;
 		adddel->seen = 1;
 		adddel->add = stat.files[i]->added;
 		adddel->del = stat.files[i]->deleted;
@@ -396,6 +481,7 @@ static void collect_changes_cb(struct diff_queue_struct *q,
 			adddel->unmerged = 1;
 		}
 	}
+	free_diffstat_info(&stat);
 }
 
 enum modified_files_filter {
@@ -406,10 +492,10 @@ enum modified_files_filter {
 
 static int get_modified_files(struct repository *r,
 			      enum modified_files_filter filter,
+			      struct prefix_item_list *files,
+			      const struct pathspec *ps,
 			      size_t *unmerged_count,
-			      size_t *binary_count,
-			      struct file_list *list,
-			      const struct pathspec *ps)
+			      size_t *binary_count)
 {
 	struct object_id head_oid;
 	int is_initial = !resolve_ref_unsafe("HEAD", RESOLVE_REF_READING,
@@ -417,10 +503,12 @@ static int get_modified_files(struct repository *r,
 	struct collection_status s = { FROM_WORKTREE };
 	int i;
 
-	if (repo_read_index_preload(r, ps, 0) < 0)
+	if (discard_index(r->index) < 0 ||
+	    repo_read_index_preload(r, ps, 0) < 0)
 		return error(_("could not read index"));
 
-	s.list = list;
+	prefix_item_list_clear(files);
+	s.files = &files->items;
 	hashmap_init(&s.file_map, pathname_entry_cmp, NULL, 0);
 
 	for (i = 0; i < 2; i++) {
@@ -453,19 +541,19 @@ static int get_modified_files(struct repository *r,
 			run_diff_files(&rev, 0);
 		}
 	}
-	hashmap_free(&s.file_map, 1);
+	hashmap_free_entries(&s.file_map, struct pathname_entry, ent);
 	if (unmerged_count)
 		*unmerged_count = s.unmerged_count;
 	if (binary_count)
 		*binary_count = s.binary_count;
 
 	/* While the diffs are ordered already, we ran *two* diffs... */
-	QSORT(list->file, list->nr, file_item_cmp);
+	string_list_sort(&files->items);
 
 	return 0;
 }
 
-static void populate_wi_changes(struct strbuf *buf,
+static void render_adddel(struct strbuf *buf,
 				struct adddel *ad, const char *no_changes)
 {
 	if (ad->binary)
@@ -500,10 +588,10 @@ struct print_file_item_data {
 	unsigned only_names:1;
 };
 
-static void print_file_item(int i, int selected, struct prefix_item *item,
+static void print_file_item(int i, int selected, struct string_list_item *item,
 			    void *print_file_item_data)
 {
-	struct file_item *c = (struct file_item *)item;
+	struct file_item *c = item->util;
 	struct print_file_item_data *d = print_file_item_data;
 	const char *highlighted = NULL;
 
@@ -512,86 +600,75 @@ static void print_file_item(int i, int selected, struct prefix_item *item,
 	strbuf_reset(&d->buf);
 
 	/* Format the item with the prefix highlighted. */
-	if (item->prefix_length > 0 &&
-	    is_valid_prefix(item->name, item->prefix_length)) {
+	if (c->prefix_length > 0 &&
+	    is_valid_prefix(item->string, c->prefix_length)) {
 		strbuf_reset(&d->name);
 		strbuf_addf(&d->name, "%s%.*s%s%s", d->color,
-			    (int)item->prefix_length, item->name, d->reset,
-			    item->name + item->prefix_length);
+			    (int)c->prefix_length, item->string, d->reset,
+			    item->string + c->prefix_length);
 		highlighted = d->name.buf;
 	}
 
 	if (d->only_names) {
 		printf("%c%2d: %s", selected ? '*' : ' ', i + 1,
-		       highlighted ? highlighted : item->name);
+		       highlighted ? highlighted : item->string);
 		return;
 	}
 
-	populate_wi_changes(&d->worktree, &c->worktree, _("nothing"));
-	populate_wi_changes(&d->index, &c->index, _("unchanged"));
-	strbuf_addf(&d->buf, d->modified_fmt,
-		    d->index.buf, d->worktree.buf,
-		    highlighted ? highlighted : item->name);
+	render_adddel(&d->worktree, &c->worktree, _("nothing"));
+	render_adddel(&d->index, &c->index, _("unchanged"));
+
+	strbuf_addf(&d->buf, d->modified_fmt, d->index.buf, d->worktree.buf,
+		    highlighted ? highlighted : item->string);
 
 	printf("%c%2d: %s", selected ? '*' : ' ', i + 1, d->buf.buf);
 }
 
 static int run_status(struct add_i_state *s, const struct pathspec *ps,
-		      struct file_list *files,
+		      struct prefix_item_list *files,
 		      struct list_and_choose_options *opts)
 {
-	reset_file_list(files);
-
-	if (get_modified_files(s->r, 0, NULL, NULL, files, ps) < 0)
+	if (get_modified_files(s->r, NO_FILTER, files, ps, NULL, NULL) < 0)
 		return -1;
 
-	if (files->nr)
-		list((struct prefix_item **)files->file, NULL, files->nr,
-		     s, &opts->list_opts);
+	list(s, &files->items, NULL, &opts->list_opts);
 	putchar('\n');
 
 	return 0;
 }
 
 static int run_update(struct add_i_state *s, const struct pathspec *ps,
-		      struct file_list *files,
+		      struct prefix_item_list *files,
 		      struct list_and_choose_options *opts)
 {
-	int res = 0, fd, *selected = NULL;
+	int res = 0, fd;
 	size_t count, i;
 	struct lock_file index_lock;
 
-	reset_file_list(files);
-
-	if (get_modified_files(s->r, WORKTREE_ONLY, NULL, NULL, files, ps) < 0)
+	if (get_modified_files(s->r, WORKTREE_ONLY, files, ps, NULL, NULL) < 0)
 		return -1;
 
-	if (!files->nr) {
+	if (!files->items.nr) {
 		putchar('\n');
 		return 0;
 	}
 
 	opts->prompt = N_("Update");
-	CALLOC_ARRAY(selected, files->nr);
-
-	count = list_and_choose((struct prefix_item **)files->file,
-				selected, files->nr, s, opts);
+	count = list_and_choose(s, files, opts);
 	if (count <= 0) {
 		putchar('\n');
-		free(selected);
 		return 0;
 	}
 
 	fd = repo_hold_locked_index(s->r, &index_lock, LOCK_REPORT_ON_ERROR);
 	if (fd < 0) {
 		putchar('\n');
-		free(selected);
 		return -1;
 	}
 
-	for (i = 0; i < files->nr; i++) {
-		const char *name = files->file[i]->item.name;
-		if (selected[i] &&
+	for (i = 0; i < files->items.nr; i++) {
+		const char *name = files->items.items[i].string;
+		if (files->selected[i] &&
 		    add_file_to_index(s->r->index, name, 0) < 0) {
 			res = error(_("could not stage '%s'"), name);
 			break;
@@ -606,7 +683,6 @@ static int run_update(struct add_i_state *s, const struct pathspec *ps,
 			  "updated %d paths\n", count), (int)count);
 
 	putchar('\n');
-	free(selected);
 	return res;
 }
 
@@ -634,10 +710,10 @@ static void revert_from_diff(struct diff_queue_struct *q,
 }
 
 static int run_revert(struct add_i_state *s, const struct pathspec *ps,
-		      struct file_list *files,
+		      struct prefix_item_list *files,
 		      struct list_and_choose_options *opts)
 {
-	int res = 0, fd, *selected = NULL;
+	int res = 0, fd;
 	size_t count, i, j;
 
 	struct object_id oid;
@@ -648,20 +724,16 @@ static int run_revert(struct add_i_state *s, const struct pathspec *ps,
 	struct tree *tree;
 	struct diff_options diffopt = { NULL };
 
-	reset_file_list(files);
-	if (get_modified_files(s->r, INDEX_ONLY, NULL, NULL, files, ps) < 0)
+	if (get_modified_files(s->r, INDEX_ONLY, files, ps, NULL, NULL) < 0)
 		return -1;
 
-	if (!files->nr) {
+	if (!files->items.nr) {
 		putchar('\n');
 		return 0;
 	}
 
 	opts->prompt = N_("Revert");
-	CALLOC_ARRAY(selected, files->nr);
-
-	count = list_and_choose((struct prefix_item **)files->file,
-				selected, files->nr, s, opts);
+	count = list_and_choose(s, files, opts);
 	if (count <= 0)
 		goto finish_revert;
 
@@ -683,9 +755,9 @@ static int run_revert(struct add_i_state *s, const struct pathspec *ps,
 	}
 
 	ALLOC_ARRAY(paths, count + 1);
-	for (i = j = 0; i < files->nr; i++)
-		if (selected[i])
-			paths[j++] = files->file[i]->item.name;
+	for (i = j = 0; i < files->items.nr; i++)
+		if (files->selected[i])
+			paths[j++] = files->items.items[i].string;
 	paths[j] = NULL;
 
 	parse_pathspec(&diffopt.pathspec, 0,
@@ -710,71 +782,68 @@ static int run_revert(struct add_i_state *s, const struct pathspec *ps,
 				       COMMIT_LOCK) < 0)
 		res = -1;
 	else
-		res = repo_refresh_and_write_index(s->r, REFRESH_QUIET, 1);
+		res = repo_refresh_and_write_index(s->r, REFRESH_QUIET, 0, 1,
+						   NULL, NULL, NULL);
+
 	if (!res)
 		printf(Q_("reverted %d path\n",
 			  "reverted %d paths\n", count), (int)count);
 
 finish_revert:
 	putchar('\n');
-	free(selected);
 	return res;
 }
 
-static int get_untracked_files(struct repository *r, struct file_list *list,
+static int get_untracked_files(struct repository *r,
+			       struct prefix_item_list *files,
 			       const struct pathspec *ps)
 {
 	struct dir_struct dir = { 0 };
 	size_t i;
+	struct strbuf buf = STRBUF_INIT;
 
 	if (repo_read_index(r) < 0)
 		return error(_("could not read index"));
 
+	prefix_item_list_clear(files);
 	setup_standard_excludes(&dir);
-	add_exclude_list(&dir, EXC_CMDL, "--exclude option");
+	add_pattern_list(&dir, EXC_CMDL, "--exclude option");
 	fill_directory(&dir, r->index, ps);
 
 	for (i = 0; i < dir.nr; i++) {
 		struct dir_entry *ent = dir.entries[i];
 
 		if (index_name_is_other(r->index, ent->name, ent->len)) {
-			struct file_item *item;
-
-			FLEXPTR_ALLOC_MEM(item, item.name, ent->name, ent->len);
-
-			ALLOC_GROW(list->file, list->nr + 1, list->alloc);
-			list->file[list->nr++] = item;
+			strbuf_reset(&buf);
+			strbuf_add(&buf, ent->name, ent->len);
+			add_file_item(&files->items, buf.buf);
 		}
 	}
 
+	strbuf_release(&buf);
 	return 0;
 }
 
 static int run_add_untracked(struct add_i_state *s, const struct pathspec *ps,
-		      struct file_list *files,
+		      struct prefix_item_list *files,
 		      struct list_and_choose_options *opts)
 {
 	struct print_file_item_data *d = opts->list_opts.print_item_data;
-	int res = 0, fd, *selected = NULL;
+	int res = 0, fd;
 	size_t count, i;
-
 	struct lock_file index_lock;
 
-	reset_file_list(files);
 	if (get_untracked_files(s->r, files, ps) < 0)
 		return -1;
 
-	if (!files->nr) {
+	if (!files->items.nr) {
 		printf(_("No untracked files.\n"));
 		goto finish_add_untracked;
 	}
 
 	opts->prompt = N_("Add untracked");
-	CALLOC_ARRAY(selected, files->nr);
-
 	d->only_names = 1;
-	count = list_and_choose((struct prefix_item **)files->file,
-				selected, files->nr, s, opts);
+	count = list_and_choose(s, files, opts);
 	d->only_names = 0;
 	if (count <= 0)
 		goto finish_add_untracked;
@@ -785,16 +854,17 @@ static int run_add_untracked(struct add_i_state *s, const struct pathspec *ps,
 		goto finish_add_untracked;
 	}
 
-	for (i = 0; i < files->nr; i++) {
-		const char *name = files->file[i]->item.name;
-		if (selected[i] &&
+	for (i = 0; i < files->items.nr; i++) {
+		const char *name = files->items.items[i].string;
+		if (files->selected[i] &&
 		    add_file_to_index(s->r->index, name, 0) < 0) {
 			res = error(_("could not stage '%s'"), name);
 			break;
 		}
 	}
 
-	if (!res && write_locked_index(s->r->index, &index_lock, COMMIT_LOCK) < 0)
+	if (!res &&
+	    write_locked_index(s->r->index, &index_lock, COMMIT_LOCK) < 0)
 		res = error(_("could not write index"));
 
 	if (!res)
@@ -803,41 +873,42 @@ static int run_add_untracked(struct add_i_state *s, const struct pathspec *ps,
 
 finish_add_untracked:
 	putchar('\n');
-	free(selected);
 	return res;
 }
 
 static int run_patch(struct add_i_state *s, const struct pathspec *ps,
-		     struct file_list *files,
+		     struct prefix_item_list *files,
 		     struct list_and_choose_options *opts)
 {
-	struct prefix_item **items = (struct prefix_item **)files->file;
-	int res = 0, *selected = NULL;
+	int res = 0;
 	ssize_t count, i, j;
 	size_t unmerged_count = 0, binary_count = 0;
 
-	reset_file_list(files);
-	if (get_modified_files(s->r, WORKTREE_ONLY, &unmerged_count,
-			       &binary_count, files, ps) < 0)
+	if (get_modified_files(s->r, WORKTREE_ONLY, files, ps,
+			       &unmerged_count, &binary_count) < 0)
 		return -1;
 
 	if (unmerged_count || binary_count) {
-		for (i = j = 0; i < files->nr; i++)
-			if (files->file[i]->index.binary ||
-			    files->file[i]->worktree.binary)
-				free(items[i]);
-			else if (files->file[i]->index.unmerged ||
-				 files->file[i]->worktree.unmerged) {
+		for (i = j = 0; i < files->items.nr; i++) {
+			struct file_item *item = files->items.items[i].util;
+
+			if (item->index.binary || item->worktree.binary) {
+				free(item);
+				free(files->items.items[i].string);
+			} else if (item->index.unmerged ||
+				 item->worktree.unmerged) {
 				color_fprintf_ln(stderr, s->error_color,
 						 _("ignoring unmerged: %s"),
-						 files->file[i]->item.name);
-				free(items[i]);
+						 files->items.items[i].string);
+				free(item);
+				free(files->items.items[i].string);
 			} else
-				items[j++] = items[i];
-		files->nr = j;
+				files->items.items[j++] = files->items.items[i];
+		}
+		files->items.nr = j;
 	}
 
-	if (!files->nr) {
+	if (!files->items.nr) {
 		if (binary_count)
 			fprintf(stderr, _("Only binary files changed.\n"));
 		else
@@ -846,16 +917,15 @@ static int run_patch(struct add_i_state *s, const struct pathspec *ps,
 	}
 
 	opts->prompt = N_("Patch update");
-	CALLOC_ARRAY(selected, files->nr);
-
-	count = list_and_choose(items, selected, files->nr, s, opts);
+	count = list_and_choose(s, files, opts);
 	if (count >= 0) {
 		struct argv_array args = ARGV_ARRAY_INIT;
 		struct pathspec ps_selected = { 0 };
 
-		for (i = 0; i < files->nr; i++)
-			if (selected[i])
-				argv_array_push(&args, items[i]->name);
+		for (i = 0; i < files->items.nr; i++)
+			if (files->selected[i])
+				argv_array_push(&args,
+						files->items.items[i].string);
 		parse_pathspec(&ps_selected,
 			       PATHSPEC_ALL_MAGIC & ~PATHSPEC_LITERAL,
 			       PATHSPEC_LITERAL_PATH, "", args.argv);
@@ -864,35 +934,30 @@ static int run_patch(struct add_i_state *s, const struct pathspec *ps,
 		clear_pathspec(&ps_selected);
 	}
 
-	free(selected);
 	return res;
 }
 
 static int run_diff(struct add_i_state *s, const struct pathspec *ps,
-		    struct file_list *files,
+		    struct prefix_item_list *files,
 		    struct list_and_choose_options *opts)
 {
-	struct prefix_item **items = (struct prefix_item **)files->file;
-	int res = 0, *selected = NULL;
+	int res = 0;
 	ssize_t count, i;
 
 	struct object_id oid;
 	int is_initial = !resolve_ref_unsafe("HEAD", RESOLVE_REF_READING, &oid,
 					     NULL);
-	reset_file_list(files);
-	if (get_modified_files(s->r, INDEX_ONLY, NULL, NULL, files, ps) < 0)
+	if (get_modified_files(s->r, INDEX_ONLY, files, ps, NULL, NULL) < 0)
 		return -1;
 
-	if (!files->nr) {
+	if (!files->items.nr) {
 		putchar('\n');
 		return 0;
 	}
 
 	opts->prompt = N_("Review diff");
-	CALLOC_ARRAY(selected, files->nr);
-
 	opts->flags = IMMEDIATE;
-	count = list_and_choose(items, selected, files->nr, s, opts);
+	count = list_and_choose(s, files, opts);
 	opts->flags = 0;
 	if (count >= 0) {
 		struct argv_array args = ARGV_ARRAY_INIT;
@@ -901,35 +966,33 @@ static int run_diff(struct add_i_state *s, const struct pathspec *ps,
 				 oid_to_hex(!is_initial ? &oid :
 					    s->r->hash_algo->empty_tree),
 				 "--", NULL);
-		for (i = 0; i < files->nr; i++)
-			if (selected[i])
-				argv_array_push(&args, items[i]->name);
+		for (i = 0; i < files->items.nr; i++)
+			if (files->selected[i])
+				argv_array_push(&args,
+						files->items.items[i].string);
 		res = run_command_v_opt(args.argv, 0);
 		argv_array_clear(&args);
 	}
 
 	putchar('\n');
-	free(selected);
 	return res;
 }
 
-static int run_help(struct add_i_state *s, const struct pathspec *ps,
-		    struct file_list *files,
+static int run_help(struct add_i_state *s, const struct pathspec *unused_ps,
+		    struct prefix_item_list *unused_files,
 		    struct list_and_choose_options *opts)
 {
-	const char *help_color = s->help_color;
-
-	color_fprintf_ln(stdout, help_color, "status        - %s",
+	color_fprintf_ln(stdout, s->help_color, "status        - %s",
 			 _("show paths with changes"));
-	color_fprintf_ln(stdout, help_color, "update        - %s",
+	color_fprintf_ln(stdout, s->help_color, "update        - %s",
 			 _("add working tree state to the staged set of changes"));
-	color_fprintf_ln(stdout, help_color, "revert        - %s",
+	color_fprintf_ln(stdout, s->help_color, "revert        - %s",
 			 _("revert staged set of changes back to the HEAD version"));
-	color_fprintf_ln(stdout, help_color, "patch         - %s",
+	color_fprintf_ln(stdout, s->help_color, "patch         - %s",
 			 _("pick hunks and update selectively"));
-	color_fprintf_ln(stdout, help_color, "diff          - %s",
+	color_fprintf_ln(stdout, s->help_color, "diff          - %s",
 			 _("view diff between HEAD and index"));
-	color_fprintf_ln(stdout, help_color, "add untracked - %s",
+	color_fprintf_ln(stdout, s->help_color, "add untracked - %s",
 			 _("add contents of untracked files to the staged set of changes"));
 
 	return 0;
@@ -937,49 +1000,52 @@ static int run_help(struct add_i_state *s, const struct pathspec *ps,
 
 static void choose_prompt_help(struct add_i_state *s)
 {
-	const char *help_color = s->help_color;
-	color_fprintf_ln(stdout, help_color, "%s",
+	color_fprintf_ln(stdout, s->help_color, "%s",
 			 _("Prompt help:"));
-	color_fprintf_ln(stdout, help_color, "1          - %s",
+	color_fprintf_ln(stdout, s->help_color, "1          - %s",
 			 _("select a single item"));
-	color_fprintf_ln(stdout, help_color, "3-5        - %s",
+	color_fprintf_ln(stdout, s->help_color, "3-5        - %s",
 			 _("select a range of items"));
-	color_fprintf_ln(stdout, help_color, "2-3,6-9    - %s",
+	color_fprintf_ln(stdout, s->help_color, "2-3,6-9    - %s",
 			 _("select multiple ranges"));
-	color_fprintf_ln(stdout, help_color, "foo        - %s",
+	color_fprintf_ln(stdout, s->help_color, "foo        - %s",
 			 _("select item based on unique prefix"));
-	color_fprintf_ln(stdout, help_color, "-...       - %s",
+	color_fprintf_ln(stdout, s->help_color, "-...       - %s",
 			 _("unselect specified items"));
-	color_fprintf_ln(stdout, help_color, "*          - %s",
+	color_fprintf_ln(stdout, s->help_color, "*          - %s",
 			 _("choose all items"));
-	color_fprintf_ln(stdout, help_color, "           - %s",
+	color_fprintf_ln(stdout, s->help_color, "           - %s",
 			 _("(empty) finish selecting"));
 }
+
+typedef int (*command_t)(struct add_i_state *s, const struct pathspec *ps,
+			 struct prefix_item_list *files,
+			 struct list_and_choose_options *opts);
+
+struct command_item {
+	size_t prefix_length;
+	command_t command;
+};
 
 struct print_command_item_data {
 	const char *color, *reset;
 };
 
-static void print_command_item(int i, int selected, struct prefix_item *item,
+static void print_command_item(int i, int selected,
+			       struct string_list_item *item,
 			       void *print_command_item_data)
 {
 	struct print_command_item_data *d = print_command_item_data;
+	struct command_item *util = item->util;
 
-	if (!item->prefix_length ||
-	    !is_valid_prefix(item->name, item->prefix_length))
-		printf(" %2d: %s", i + 1, item->name);
+	if (!util->prefix_length ||
+	    !is_valid_prefix(item->string, util->prefix_length))
+		printf(" %2d: %s", i + 1, item->string);
 	else
 		printf(" %2d: %s%.*s%s%s", i + 1,
-		       d->color, (int)item->prefix_length, item->name, d->reset,
-		       item->name + item->prefix_length);
+		       d->color, (int)util->prefix_length, item->string,
+		       d->reset, item->string + util->prefix_length);
 }
-
-struct command_item {
-	struct prefix_item item;
-	int (*command)(struct add_i_state *s, const struct pathspec *ps,
-		       struct file_list *files,
-		       struct list_and_choose_options *opts);
-};
 
 static void command_prompt_help(struct add_i_state *s)
 {
@@ -996,24 +1062,25 @@ static void command_prompt_help(struct add_i_state *s)
 int run_add_i(struct repository *r, const struct pathspec *ps)
 {
 	struct add_i_state s = { NULL };
-	struct print_command_item_data data;
+	struct print_command_item_data data = { "[", "]" };
 	struct list_and_choose_options main_loop_opts = {
 		{ 4, N_("*** Commands ***"), print_command_item, &data },
 		N_("What now"), SINGLETON | IMMEDIATE, command_prompt_help
 	};
-	struct command_item
-		status = { { "status" }, run_status },
-		update = { { "update" }, run_update },
-		revert = { { "revert" }, run_revert },
-		add_untracked = { { "add untracked" }, run_add_untracked },
-		patch = { { "patch" }, run_patch },
-		diff = { { "diff" }, run_diff },
-		quit = { { "quit" }, NULL },
-		help = { { "help" }, run_help };
-	struct command_item *commands[] = {
-		&status, &update, &revert, &add_untracked,
-		&patch, &diff, &quit, &help
+	struct {
+		const char *string;
+		command_t command;
+	} command_list[] = {
+		{ "status", run_status },
+		{ "update", run_update },
+		{ "revert", run_revert },
+		{ "add untracked", run_add_untracked },
+		{ "patch", run_patch },
+		{ "diff", run_diff },
+		{ "quit", NULL },
+		{ "help", run_help },
 	};
+	struct prefix_item_list commands = PREFIX_ITEM_LIST_INIT;
 
 	struct print_file_item_data print_file_item_data = {
 		"%12s %12s %s", NULL, NULL,
@@ -1024,12 +1091,18 @@ int run_add_i(struct repository *r, const struct pathspec *ps)
 		NULL, 0, choose_prompt_help
 	};
 	struct strbuf header = STRBUF_INIT;
-	struct file_list files = { NULL };
+	struct prefix_item_list files = PREFIX_ITEM_LIST_INIT;
 	ssize_t i;
 	int res = 0;
 
-	if (init_add_i_state(r, &s))
-		return error("could not parse `add -i` config");
+	for (i = 0; i < ARRAY_SIZE(command_list); i++) {
+		struct command_item *util = xcalloc(sizeof(*util), 1);
+		util->command = command_list[i].command;
+		string_list_append(&commands.items, command_list[i].string)
+			->util = util;
+	}
+
+	init_add_i_state(&s, r);
 
 	/*
 	 * When color was asked for, use the prompt color for
@@ -1038,9 +1111,6 @@ int run_add_i(struct repository *r, const struct pathspec *ps)
 	if (s.use_color) {
 		data.color = s.prompt_color;
 		data.reset = s.reset_color;
-	} else {
-		data.color = "[";
-		data.reset = "]";
 	}
 	print_file_item_data.color = data.color;
 	print_file_item_data.reset = data.reset;
@@ -1050,29 +1120,41 @@ int run_add_i(struct repository *r, const struct pathspec *ps)
 		    _("staged"), _("unstaged"), _("path"));
 	opts.list_opts.header = header.buf;
 
-	repo_refresh_and_write_index(r, REFRESH_QUIET, 1);
-	if (run_status(&s, ps, &files, &opts) < 0)
-		res = -1;
+	if (discard_index(r->index) < 0 ||
+	    repo_read_index(r) < 0 ||
+	    repo_refresh_and_write_index(r, REFRESH_QUIET, 0, 1,
+					 NULL, NULL, NULL) < 0)
+		warning(_("could not refresh index"));
+
+	res = run_status(&s, ps, &files, &opts);
 
 	for (;;) {
-		i = list_and_choose((struct prefix_item **)commands, NULL,
-				    ARRAY_SIZE(commands), &s, &main_loop_opts);
-		if (i == LIST_AND_CHOOSE_QUIT ||
-		    (i != LIST_AND_CHOOSE_ERROR && !commands[i]->command)) {
+		struct command_item *util;
+
+		i = list_and_choose(&s, &commands, &main_loop_opts);
+		if (i < 0 || i >= commands.items.nr)
+			util = NULL;
+		else
+			util = commands.items.items[i].util;
+
+		if (i == LIST_AND_CHOOSE_QUIT || (util && !util->command)) {
 			printf(_("Bye.\n"));
 			res = 0;
 			break;
 		}
-		if (i != LIST_AND_CHOOSE_ERROR)
-			res = commands[i]->command(&s, ps, &files, &opts);
+
+		if (util)
+			res = util->command(&s, ps, &files, &opts);
 	}
 
-	release_file_list(&files);
+	prefix_item_list_clear(&files);
 	strbuf_release(&print_file_item_data.buf);
 	strbuf_release(&print_file_item_data.name);
 	strbuf_release(&print_file_item_data.index);
 	strbuf_release(&print_file_item_data.worktree);
 	strbuf_release(&header);
+	prefix_item_list_clear(&commands);
+	clear_add_i_state(&s);
 
 	return res;
 }

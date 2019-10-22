@@ -14,7 +14,7 @@ typedef _sigset_t sigset_t;
 extern int core_fscache;
 extern int core_long_paths;
 
-extern int mingw_core_config(const char *var, const char *value, void *cb);
+int mingw_core_config(const char *var, const char *value, void *cb);
 #define platform_core_config mingw_core_config
 
 /*
@@ -469,10 +469,8 @@ extern int (*win32_is_mount_point)(struct strbuf *path);
 #define is_mount_point win32_is_mount_point
 #define CAN_UNLINK_MOUNT_POINTS 1
 #define PATH_SEP ';'
-extern char *mingw_query_user_email(void);
+char *mingw_query_user_email(void);
 #define query_user_email mingw_query_user_email
-extern const char *program_data_config(void);
-#define git_program_data_config program_data_config
 #if !defined(__MINGW64_VERSION_MAJOR) && (!defined(_MSC_VER) || _MSC_VER < 1800)
 #define PRIuMAX "I64u"
 #define PRId64 "I64d"
@@ -682,9 +680,9 @@ extern void open_in_gdb(void);
 /*
  * Used by Pthread API implementation for Windows
  */
-extern int err_win_to_posix(DWORD winerr);
+int err_win_to_posix(DWORD winerr);
 
 /*
  * Check current process is inside Windows Container.
  */
-extern int is_inside_windows_container(void);
+int is_inside_windows_container(void);

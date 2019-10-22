@@ -24,7 +24,6 @@
 #include "sequencer.h"
 #include "revision.h"
 #include "merge-recursive.h"
-#include "revision.h"
 #include "log-tree.h"
 #include "notes-utils.h"
 #include "rerere.h"
@@ -1072,19 +1071,6 @@ static const char *msgnum(const struct am_state *state)
 }
 
 /**
- * Refresh and write index.
- */
-static void refresh_and_write_cache(void)
-{
-	struct lock_file lock_file = LOCK_INIT;
-
-	hold_locked_index(&lock_file, LOCK_DIE_ON_ERROR);
-	refresh_cache(REFRESH_QUIET);
-	if (write_locked_index(&the_index, &lock_file, COMMIT_LOCK))
-		die(_("unable to write index file"));
-}
-
-/**
  * Dies with a user-friendly message on how to proceed after resolving the
  * problem. This message can be overridden with state->resolvemsg.
  */
@@ -1272,7 +1258,9 @@ static void get_commit_info(struct am_state *state, struct commit *commit)
 	buffer = logmsg_reencode(commit, NULL, get_commit_output_encoding());
 
 	ident_line = find_commit_header(buffer, "author", &ident_len);
-
+	if (!ident_line)
+		die(_("missing author line in commit %s"),
+		      oid_to_hex(&commit->object.oid));
 	if (split_ident_line(&id, ident_line, ident_len) < 0)
 		die(_("invalid ident line: %.*s"), (int)ident_len, ident_line);
 
@@ -1339,9 +1327,10 @@ static void write_index_patch(const struct am_state *state)
 	struct rev_info rev_info;
 	FILE *fp;
 
-	if (!get_oid_tree("HEAD", &head))
-		tree = lookup_tree(the_repository, &head);
-	else
+	if (!get_oid("HEAD", &head)) {
+		struct commit *commit = lookup_commit_or_die(&head, "HEAD");
+		tree = get_commit_tree(commit);
+	} else
 		tree = lookup_tree(the_repository,
 				   the_repository->hash_algo->empty_tree);
 
@@ -1537,7 +1526,7 @@ static int fall_back_threeway(const struct am_state *state, const char *index_pa
 	o.branch1 = "HEAD";
 	their_tree_name = xstrfmt("%.*s", linelen(state->msg), state->msg);
 	o.branch2 = their_tree_name;
-	o.detect_directory_renames = 0;
+	o.detect_directory_renames = MERGE_DIRECTORY_RENAMES_NONE;
 
 	if (state->quiet)
 		o.verbosity = 0;
@@ -1643,11 +1632,8 @@ static int do_interactive(struct am_state *state)
 {
 	assert(state->msg);
 
-	if (!isatty(0))
-		die(_("cannot be interactive without stdin connected to a terminal."));
-
 	for (;;) {
-		const char *reply;
+		char reply[64];
 
 		puts(_("Commit Body is:"));
 		puts("--------------------------");
@@ -1659,11 +1645,11 @@ static int do_interactive(struct am_state *state)
 		 * in your translation. The program will only accept English
 		 * input at this point.
 		 */
-		reply = git_prompt(_("Apply? [y]es/[n]o/[e]dit/[v]iew patch/[a]ccept all: "), PROMPT_ECHO);
+		printf(_("Apply? [y]es/[n]o/[e]dit/[v]iew patch/[a]ccept all: "));
+		if (!fgets(reply, sizeof(reply), stdin))
+			die("unable to read from stdin; aborting");
 
-		if (!reply) {
-			continue;
-		} else if (*reply == 'y' || *reply == 'Y') {
+		if (*reply == 'y' || *reply == 'Y') {
 			return 0;
 		} else if (*reply == 'a' || *reply == 'A') {
 			state->interactive = 0;
@@ -1705,7 +1691,8 @@ static void am_run(struct am_state *state, int resume)
 
 	unlink(am_path(state, "dirtyindex"));
 
-	refresh_and_write_cache();
+	if (refresh_and_write_cache(REFRESH_QUIET, 0, 0) < 0)
+		die(_("unable to write index file"));
 
 	if (repo_index_has_changes(the_repository, NULL, &sb)) {
 		write_state_bool(state, "dirtyindex", 1);
@@ -1958,7 +1945,7 @@ static int clean_index(const struct object_id *head, const struct object_id *rem
 	if (merge_tree(remote_tree))
 		return -1;
 
-	remove_branch_state(the_repository);
+	remove_branch_state(the_repository, 0);
 
 	return 0;
 }
@@ -2333,6 +2320,9 @@ int cmd_am(int argc, const char **argv, const char *prefix)
 			else
 				argv_array_push(&paths, mkpath("%s/%s", prefix, argv[i]));
 		}
+
+		if (state.interactive && !paths.argc)
+			die(_("interactive mode requires patches on the command line"));
 
 		am_setup(&state, patch_format, paths.argv, keep_cr);
 
